@@ -1201,7 +1201,7 @@ static stellaris_board_info stellaris_boards[] = {
   { "LM3S6965EVB",
     0x10010002,
     0x1073402e,
-    0x00ff007f, /* dc0 */
+    0x03ff01ff, /* dc0 */
     0x001133ff,
     0x030f5317,
     0x0f0f87ff,
@@ -1237,6 +1237,8 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
 
     flash_size = (((board->dc0 & 0xffff) + 1) << 1) * 1024;
     sram_size = ((board->dc0 >> 18) + 1) * 1024;
+
+    printf("Flash size: %d - SRAM size: %d\n", flash_size, sram_size);
 
     /* Flash programming is done via the SCU, so pretend it is ROM.  */
     memory_region_init_ram(flash, NULL, "stellaris.flash", flash_size,
