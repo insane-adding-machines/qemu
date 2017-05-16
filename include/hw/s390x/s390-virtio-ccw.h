@@ -28,6 +28,7 @@ typedef struct S390CcwMachineState {
     /*< public >*/
     bool aes_key_wrap;
     bool dea_key_wrap;
+    uint8_t loadparm[8];
 } S390CcwMachineState;
 
 typedef struct S390CcwMachineClass {
@@ -36,9 +37,12 @@ typedef struct S390CcwMachineClass {
 
     /*< public >*/
     bool ri_allowed;
+    bool cpu_model_allowed;
 } S390CcwMachineClass;
 
 /* runtime-instrumentation allowed by the machine */
 bool ri_allowed(void);
+/* cpu model allowed by the machine */
+bool cpu_model_allowed(void);
 
 #endif

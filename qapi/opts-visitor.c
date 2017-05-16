@@ -164,7 +164,7 @@ opts_check_struct(Visitor *v, Error **errp)
     GHashTableIter iter;
     GQueue *any;
 
-    if (ov->depth > 0) {
+    if (ov->depth > 1) {
         return;
     }
 
@@ -180,7 +180,7 @@ opts_check_struct(Visitor *v, Error **errp)
 
 
 static void
-opts_end_struct(Visitor *v)
+opts_end_struct(Visitor *v, void **obj)
 {
     OptsVisitor *ov = to_ov(v);
 
@@ -273,7 +273,17 @@ opts_next_list(Visitor *v, GenericList *tail, size_t size)
 
 
 static void
-opts_end_list(Visitor *v)
+opts_check_list(Visitor *v, Error **errp)
+{
+    /*
+     * Unvisited list elements will be reported later when checking
+     * whether unvisited struct members remain.
+     */
+}
+
+
+static void
+opts_end_list(Visitor *v, void **obj)
 {
     OptsVisitor *ov = to_ov(v);
 
@@ -481,23 +491,20 @@ opts_type_size(Visitor *v, const char *name, uint64_t *obj, Error **errp)
 {
     OptsVisitor *ov = to_ov(v);
     const QemuOpt *opt;
-    int64_t val;
-    char *endptr;
+    int err;
 
     opt = lookup_scalar(ov, name, errp);
     if (!opt) {
         return;
     }
 
-    val = qemu_strtosz_suffix(opt->str ? opt->str : "", &endptr,
-                         QEMU_STRTOSZ_DEFSUFFIX_B);
-    if (val < 0 || *endptr) {
+    err = qemu_strtosz(opt->str ? opt->str : "", NULL, obj);
+    if (err < 0) {
         error_setg(errp, QERR_INVALID_PARAMETER_VALUE, opt->name,
-                   "a size value representible as a non-negative int64");
+                   "a size value");
         return;
     }
 
-    *obj = val;
     processed(ov, name);
 }
 
@@ -513,11 +520,25 @@ opts_optional(Visitor *v, const char *name, bool *present)
 }
 
 
-OptsVisitor *
+static void
+opts_free(Visitor *v)
+{
+    OptsVisitor *ov = to_ov(v);
+
+    if (ov->unprocessed_opts != NULL) {
+        g_hash_table_destroy(ov->unprocessed_opts);
+    }
+    g_free(ov->fake_id_opt);
+    g_free(ov);
+}
+
+
+Visitor *
 opts_visitor_new(const QemuOpts *opts)
 {
     OptsVisitor *ov;
 
+    assert(opts);
     ov = g_malloc0(sizeof *ov);
 
     ov->visitor.type = VISITOR_INPUT;
@@ -528,6 +549,7 @@ opts_visitor_new(const QemuOpts *opts)
 
     ov->visitor.start_list = &opts_start_list;
     ov->visitor.next_list  = &opts_next_list;
+    ov->visitor.check_list = &opts_check_list;
     ov->visitor.end_list   = &opts_end_list;
 
     ov->visitor.type_int64  = &opts_type_int64;
@@ -540,26 +562,9 @@ opts_visitor_new(const QemuOpts *opts)
      * skip some mandatory methods... */
 
     ov->visitor.optional = &opts_optional;
+    ov->visitor.free = opts_free;
 
     ov->opts_root = opts;
 
-    return ov;
-}
-
-
-void
-opts_visitor_cleanup(OptsVisitor *ov)
-{
-    if (ov->unprocessed_opts != NULL) {
-        g_hash_table_destroy(ov->unprocessed_opts);
-    }
-    g_free(ov->fake_id_opt);
-    g_free(ov);
-}
-
-
-Visitor *
-opts_get_visitor(OptsVisitor *ov)
-{
     return &ov->visitor;
 }

@@ -348,6 +348,11 @@ bool throttle_is_valid(ThrottleConfig *cfg, Error **errp)
                        " bps/iops values");
             return false;
         }
+
+        if (cfg->buckets[i].max && cfg->buckets[i].max < cfg->buckets[i].avg) {
+            error_setg(errp, "bps_max/iops_max cannot be lower than bps/iops");
+            return false;
+        }
     }
 
     return true;
@@ -372,6 +377,14 @@ static void throttle_fix_bucket(LeakyBucket *bkt)
     min = bkt->avg / 10;
     if (bkt->avg && !bkt->max) {
         bkt->max = min;
+    }
+}
+
+/* undo internal bucket parameter changes (see throttle_fix_bucket()) */
+static void throttle_unfix_bucket(LeakyBucket *bkt)
+{
+    if (bkt->max < bkt->avg) {
+        bkt->max = 0;
     }
 }
 
@@ -415,7 +428,13 @@ void throttle_config(ThrottleState *ts,
  */
 void throttle_get_config(ThrottleState *ts, ThrottleConfig *cfg)
 {
+    int i;
+
     *cfg = ts->cfg;
+
+    for (i = 0; i < BUCKETS_COUNT; i++) {
+        throttle_unfix_bucket(&cfg->buckets[i]);
+    }
 }
 
 

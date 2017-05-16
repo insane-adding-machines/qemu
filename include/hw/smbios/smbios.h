@@ -1,5 +1,6 @@
 #ifndef QEMU_SMBIOS_H
 #define QEMU_SMBIOS_H
+
 /*
  * SMBIOS Support
  *
@@ -256,7 +257,7 @@ struct smbios_type_127 {
     struct smbios_structure_header header;
 } QEMU_PACKED;
 
-void smbios_entry_add(QemuOpts *opts);
+void smbios_entry_add(QemuOpts *opts, Error **errp);
 void smbios_set_cpuid(uint32_t version, uint32_t features);
 void smbios_set_defaults(const char *manufacturer, const char *product,
                          const char *version, bool legacy_mode,
@@ -266,4 +267,4 @@ void smbios_get_tables(const struct smbios_phys_mem_area *mem_array,
                        const unsigned int mem_array_size,
                        uint8_t **tables, size_t *tables_len,
                        uint8_t **anchor, size_t *anchor_len);
-#endif /*QEMU_SMBIOS_H */
+#endif /* QEMU_SMBIOS_H */

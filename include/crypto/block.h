@@ -18,8 +18,8 @@
  *
  */
 
-#ifndef QCRYPTO_BLOCK_H__
-#define QCRYPTO_BLOCK_H__
+#ifndef QCRYPTO_BLOCK_H
+#define QCRYPTO_BLOCK_H
 
 #include "crypto/cipher.h"
 #include "crypto/ivgen.h"
@@ -33,20 +33,20 @@ typedef ssize_t (*QCryptoBlockReadFunc)(QCryptoBlock *block,
                                         size_t offset,
                                         uint8_t *buf,
                                         size_t buflen,
-                                        Error **errp,
-                                        void *opaque);
+                                        void *opaque,
+                                        Error **errp);
 
 typedef ssize_t (*QCryptoBlockInitFunc)(QCryptoBlock *block,
                                         size_t headerlen,
-                                        Error **errp,
-                                        void *opaque);
+                                        void *opaque,
+                                        Error **errp);
 
 typedef ssize_t (*QCryptoBlockWriteFunc)(QCryptoBlock *block,
                                          size_t offset,
                                          const uint8_t *buf,
                                          size_t buflen,
-                                         Error **errp,
-                                         void *opaque);
+                                         void *opaque,
+                                         Error **errp);
 
 /**
  * qcrypto_block_has_format:
@@ -137,6 +137,22 @@ QCryptoBlock *qcrypto_block_create(QCryptoBlockCreateOptions *options,
                                    QCryptoBlockWriteFunc writefunc,
                                    void *opaque,
                                    Error **errp);
+
+
+/**
+ * qcrypto_block_get_info:
+ * @block: the block encryption object
+ * @errp: pointer to a NULL-initialized error object
+ *
+ * Get information about the configuration options for the
+ * block encryption object. This includes details such as
+ * the cipher algorithms, modes, and initialization vector
+ * generators.
+ *
+ * Returns: a block encryption info object, or NULL on error
+ */
+QCryptoBlockInfo *qcrypto_block_get_info(QCryptoBlock *block,
+                                         Error **errp);
 
 /**
  * @qcrypto_block_decrypt:
@@ -229,4 +245,4 @@ uint64_t qcrypto_block_get_payload_offset(QCryptoBlock *block);
  */
 void qcrypto_block_free(QCryptoBlock *block);
 
-#endif /* QCRYPTO_BLOCK_H__ */
+#endif /* QCRYPTO_BLOCK_H */

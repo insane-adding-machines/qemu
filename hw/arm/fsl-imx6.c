@@ -67,7 +67,7 @@ static void fsl_imx6_init(Object *obj)
         object_property_add_child(obj, name, OBJECT(&s->uart[i]), NULL);
     }
 
-    object_initialize(&s->gpt, sizeof(s->gpt), TYPE_IMX_GPT);
+    object_initialize(&s->gpt, sizeof(s->gpt), TYPE_IMX6_GPT);
     qdev_set_parent_bus(DEVICE(&s->gpt), sysbus_get_default());
     object_property_add_child(obj, "gpt", OBJECT(&s->gpt), NULL);
 
@@ -187,13 +187,13 @@ static void fsl_imx6_realize(DeviceState *dev, Error **errp)
         };
 
         if (i < MAX_SERIAL_PORTS) {
-            CharDriverState *chr;
+            Chardev *chr;
 
             chr = serial_hds[i];
 
             if (!chr) {
                 char *label = g_strdup_printf("imx6.uart%d", i + 1);
-                chr = qemu_chr_new(label, "null", NULL);
+                chr = qemu_chr_new(label, "null");
                 g_free(label);
                 serial_hds[i] = chr;
             }
@@ -399,8 +399,8 @@ static void fsl_imx6_realize(DeviceState *dev, Error **errp)
                                         FSL_IMX6_ENET_MAC_1588_IRQ));
 
     /* ROM memory */
-    memory_region_init_rom_device(&s->rom, NULL, NULL, NULL, "imx6.rom",
-                                  FSL_IMX6_ROM_SIZE, &err);
+    memory_region_init_rom(&s->rom, NULL, "imx6.rom",
+                           FSL_IMX6_ROM_SIZE, &err);
     if (err) {
         error_propagate(errp, err);
         return;
@@ -409,8 +409,8 @@ static void fsl_imx6_realize(DeviceState *dev, Error **errp)
                                 &s->rom);
 
     /* CAAM memory */
-    memory_region_init_rom_device(&s->caam, NULL, NULL, NULL, "imx6.caam",
-                                  FSL_IMX6_CAAM_MEM_SIZE, &err);
+    memory_region_init_rom(&s->caam, NULL, "imx6.caam",
+                           FSL_IMX6_CAAM_MEM_SIZE, &err);
     if (err) {
         error_propagate(errp, err);
         return;
@@ -442,11 +442,6 @@ static void fsl_imx6_class_init(ObjectClass *oc, void *data)
 
     dc->realize = fsl_imx6_realize;
 
-    /*
-     * Reason: creates an ARM CPU, thus use after free(), see
-     * arm_cpu_class_init()
-     */
-    dc->cannot_destroy_with_object_finalize_yet = true;
     dc->desc = "i.MX6 SOC";
 }
 

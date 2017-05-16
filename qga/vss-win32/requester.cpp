@@ -13,8 +13,9 @@
 #include "qemu/osdep.h"
 #include "vss-common.h"
 #include "requester.h"
-#include "inc/win2003/vswriter.h"
-#include "inc/win2003/vsbackup.h"
+#include "install.h"
+#include <inc/win2003/vswriter.h>
+#include <inc/win2003/vsbackup.h>
 
 /* Max wait time for frozen event (VSS can only hold writes for 10 seconds) */
 #define VSS_TIMEOUT_FREEZE_MSEC 10000
@@ -501,4 +502,5 @@ void requester_thaw(int *num_vols, ErrorSet *errset)
     requester_cleanup();
 
     CoUninitialize();
+    StopService();
 }

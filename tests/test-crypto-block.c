@@ -28,7 +28,7 @@
 #include <sys/resource.h>
 #endif
 
-#if defined(CONFIG_UUID) && (defined(_WIN32) || defined RUSAGE_THREAD)
+#if (defined(_WIN32) || defined RUSAGE_THREAD)
 #define TEST_LUKS
 #else
 #undef TEST_LUKS
@@ -190,8 +190,8 @@ static ssize_t test_block_read_func(QCryptoBlock *block,
                                     size_t offset,
                                     uint8_t *buf,
                                     size_t buflen,
-                                    Error **errp,
-                                    void *opaque)
+                                    void *opaque,
+                                    Error **errp)
 {
     Buffer *header = opaque;
 
@@ -205,8 +205,8 @@ static ssize_t test_block_read_func(QCryptoBlock *block,
 
 static ssize_t test_block_init_func(QCryptoBlock *block,
                                     size_t headerlen,
-                                    Error **errp,
-                                    void *opaque)
+                                    void *opaque,
+                                    Error **errp)
 {
     Buffer *header = opaque;
 
@@ -222,8 +222,8 @@ static ssize_t test_block_write_func(QCryptoBlock *block,
                                      size_t offset,
                                      const uint8_t *buf,
                                      size_t buflen,
-                                     Error **errp,
-                                     void *opaque)
+                                     void *opaque,
+                                     Error **errp)
 {
     Buffer *header = opaque;
 

@@ -6,7 +6,7 @@
 #include "qmp-commands.h"
 
 static QemuOptsList *vm_config_groups[48];
-static QemuOptsList *drive_config_groups[4];
+static QemuOptsList *drive_config_groups[5];
 
 static QemuOptsList *find_list(QemuOptsList **lists, const char *group,
                                Error **errp)
@@ -227,6 +227,12 @@ static QemuOptsList machine_opts = {
             .name = "dea-key-wrap",
             .type = QEMU_OPT_BOOL,
             .help = "enable/disable DEA key wrapping using the CPACF wrapping key",
+        },{
+            .name = "loadparm",
+            .type = QEMU_OPT_STRING,
+            .help = "Up to 8 chars in set of [A-Za-z0-9. ](lower case chars"
+                    " converted to upper case) to pass to machine"
+                    " loader, boot manager, and guest kernel",
         },
         { /* End of list */ }
     }

@@ -22,8 +22,8 @@
  * THE SOFTWARE.
  */
 
-#ifndef HW_EXTRAXFS_H
-#define HW_EXTRAXFS_H 1
+#ifndef HW_ETRAXFS_H
+#define HW_ETRAXFS_H
 
 #include "net/net.h"
 #include "hw/cris/etraxfs_dma.h"
@@ -48,7 +48,7 @@ etraxfs_eth_init(NICInfo *nd, hwaddr base, int phyaddr,
 
 static inline DeviceState *etraxfs_ser_create(hwaddr addr,
                                               qemu_irq irq,
-                                              CharDriverState *chr)
+                                              Chardev *chr)
 {
     DeviceState *dev;
     SysBusDevice *s;

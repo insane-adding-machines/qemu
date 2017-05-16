@@ -79,15 +79,16 @@ static IOMMUAccessFlags spapr_tce_iommu_access_flags(uint64_t tce)
 
 static uint64_t *spapr_tce_alloc_table(uint32_t liobn,
                                        uint32_t page_shift,
+                                       uint64_t bus_offset,
                                        uint32_t nb_table,
                                        int *fd,
                                        bool need_vfio)
 {
     uint64_t *table = NULL;
-    uint64_t window_size = (uint64_t)nb_table << page_shift;
 
-    if (kvm_enabled() && !(window_size >> 32)) {
-        table = kvmppc_create_spapr_tce(liobn, window_size, fd, need_vfio);
+    if (kvm_enabled()) {
+        table = kvmppc_create_spapr_tce(liobn, page_shift, bus_offset, nb_table,
+                                        fd, need_vfio);
     }
 
     if (!table) {
@@ -154,6 +155,19 @@ static uint64_t spapr_tce_get_min_page_size(MemoryRegion *iommu)
     sPAPRTCETable *tcet = container_of(iommu, sPAPRTCETable, iommu);
 
     return 1ULL << tcet->page_shift;
+}
+
+static void spapr_tce_notify_flag_changed(MemoryRegion *iommu,
+                                          IOMMUNotifierFlag old,
+                                          IOMMUNotifierFlag new)
+{
+    struct sPAPRTCETable *tbl = container_of(iommu, sPAPRTCETable, iommu);
+
+    if (old == IOMMU_NOTIFIER_NONE && new != IOMMU_NOTIFIER_NONE) {
+        spapr_tce_set_need_vfio(tbl, true);
+    } else if (old != IOMMU_NOTIFIER_NONE && new == IOMMU_NOTIFIER_NONE) {
+        spapr_tce_set_need_vfio(tbl, false);
+    }
 }
 
 static int spapr_tce_table_post_load(void *opaque, int version_id)
@@ -236,6 +250,7 @@ static const VMStateDescription vmstate_spapr_tce_table = {
 static MemoryRegionIOMMUOps spapr_iommu_ops = {
     .translate = spapr_tce_translate_iommu,
     .get_min_page_size = spapr_tce_get_min_page_size,
+    .notify_flag_changed = spapr_tce_notify_flag_changed,
 };
 
 static int spapr_tce_table_realize(DeviceState *dev)
@@ -298,8 +313,8 @@ sPAPRTCETable *spapr_tce_new_table(DeviceState *owner, uint32_t liobn)
     char tmp[32];
 
     if (spapr_tce_find_by_liobn(liobn)) {
-        fprintf(stderr, "Attempted to create TCE table with duplicate"
-                " LIOBN 0x%x\n", liobn);
+        error_report("Attempted to create TCE table with duplicate"
+                " LIOBN 0x%x", liobn);
         return NULL;
     }
 
@@ -328,6 +343,7 @@ void spapr_tce_table_enable(sPAPRTCETable *tcet,
     tcet->nb_table = nb_table;
     tcet->table = spapr_tce_alloc_table(tcet->liobn,
                                         tcet->page_shift,
+                                        tcet->bus_offset,
                                         tcet->nb_table,
                                         &tcet->fd,
                                         tcet->need_vfio);
@@ -373,7 +389,9 @@ static void spapr_tce_reset(DeviceState *dev)
     sPAPRTCETable *tcet = SPAPR_TCE_TABLE(dev);
     size_t table_size = tcet->nb_table * sizeof(uint64_t);
 
-    memset(tcet->table, 0, table_size);
+    if (tcet->nb_table) {
+        memset(tcet->table, 0, table_size);
+    }
 }
 
 static target_ulong put_tce_emu(sPAPRTCETable *tcet, target_ulong ioba,

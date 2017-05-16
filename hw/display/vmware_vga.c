@@ -676,11 +676,13 @@ static void vmsvga_fifo_run(struct vmsvga_state_s *s)
             cursor.bpp = vmsvga_fifo_read(s);
 
             args = SVGA_BITMAP_SIZE(x, y) + SVGA_PIXMAP_SIZE(x, y, cursor.bpp);
-            if (cursor.width > 256 ||
-                cursor.height > 256 ||
-                cursor.bpp > 32 ||
-                SVGA_BITMAP_SIZE(x, y) > sizeof cursor.mask ||
-                SVGA_PIXMAP_SIZE(x, y, cursor.bpp) > sizeof cursor.image) {
+            if (cursor.width > 256
+                || cursor.height > 256
+                || cursor.bpp > 32
+                || SVGA_BITMAP_SIZE(x, y)
+                    > sizeof(cursor.mask) / sizeof(cursor.mask[0])
+                || SVGA_PIXMAP_SIZE(x, y, cursor.bpp)
+                    > sizeof(cursor.image) / sizeof(cursor.image[0])) {
                     goto badcmd;
             }
 
@@ -1116,9 +1118,9 @@ static void vmsvga_update_display(void *opaque)
 {
     struct vmsvga_state_s *s = opaque;
     DisplaySurface *surface;
-    bool dirty = false;
 
-    if (!s->enable) {
+    if (!s->enable || !s->config) {
+        /* in standard vga mode */
         s->vga.hw_ops->gfx_update(&s->vga);
         return;
     }
@@ -1129,25 +1131,10 @@ static void vmsvga_update_display(void *opaque)
     vmsvga_fifo_run(s);
     vmsvga_update_rect_flush(s);
 
-    /*
-     * Is it more efficient to look at vram VGA-dirty bits or wait
-     * for the driver to issue SVGA_CMD_UPDATE?
-     */
-    if (memory_region_is_logging(&s->vga.vram, DIRTY_MEMORY_VGA)) {
-        vga_sync_dirty_bitmap(&s->vga);
-        dirty = memory_region_get_dirty(&s->vga.vram, 0,
-            surface_stride(surface) * surface_height(surface),
-            DIRTY_MEMORY_VGA);
-    }
-    if (s->invalidated || dirty) {
+    if (s->invalidated) {
         s->invalidated = 0;
         dpy_gfx_update(s->vga.con, 0, 0,
                    surface_width(surface), surface_height(surface));
-    }
-    if (dirty) {
-        memory_region_reset_dirty(&s->vga.vram, 0,
-            surface_stride(surface) * surface_height(surface),
-            DIRTY_MEMORY_VGA);
     }
 }
 

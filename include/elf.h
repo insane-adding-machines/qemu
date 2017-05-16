@@ -1,6 +1,5 @@
-#ifndef _QEMU_ELF_H
-#define _QEMU_ELF_H
-
+#ifndef QEMU_ELF_H
+#define QEMU_ELF_H
 
 /* 32-bit ELF base types. */
 typedef uint32_t Elf32_Addr;
@@ -126,6 +125,8 @@ typedef int64_t  Elf64_Sxword;
  * This is the old interim value for S/390 architecture
  */
 #define EM_S390_OLD     0xA390
+
+#define EM_ALTERA_NIOS2 113     /* Altera Nios II soft-core processor */
 
 #define EM_MICROBLAZE      189
 #define EM_MICROBLAZE_OLD  0xBAAB
@@ -1573,4 +1574,4 @@ struct elf32_fdpic_loadmap {
 #endif /* ELF_CLASS */
 
 
-#endif /* _QEMU_ELF_H */
+#endif /* QEMU_ELF_H */

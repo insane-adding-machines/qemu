@@ -53,6 +53,15 @@ static void chr_read(void *opaque, const void *buf, size_t size)
         return;
     }
 
+    /* we can't modify the virtqueue until
+     * our state is fully synced
+     */
+
+    if (!runstate_check(RUN_STATE_RUNNING)) {
+        trace_virtio_rng_cpu_is_stopped(vrng, size);
+        return;
+    }
+
     vrng->quota_remaining -= size;
 
     offset = 0;
@@ -61,6 +70,7 @@ static void chr_read(void *opaque, const void *buf, size_t size)
         if (!elem) {
             break;
         }
+        trace_virtio_rng_popped(vrng);
         len = iov_from_buf(elem->in_sg, elem->in_num,
                            0, buf + offset, size - offset);
         offset += len;
@@ -120,33 +130,21 @@ static uint64_t get_features(VirtIODevice *vdev, uint64_t f, Error **errp)
     return f;
 }
 
-static void virtio_rng_save(QEMUFile *f, void *opaque)
-{
-    VirtIODevice *vdev = opaque;
-
-    virtio_save(vdev, f);
-}
-
-static int virtio_rng_load(QEMUFile *f, void *opaque, int version_id)
+static void virtio_rng_vm_state_change(void *opaque, int running,
+                                       RunState state)
 {
     VirtIORNG *vrng = opaque;
-    int ret;
 
-    if (version_id != 1) {
-        return -EINVAL;
-    }
-    ret = virtio_load(VIRTIO_DEVICE(vrng), f, version_id);
-    if (ret != 0) {
-        return ret;
-    }
+    trace_virtio_rng_vm_state_change(vrng, running, state);
 
     /* We may have an element ready but couldn't process it due to a quota
-     * limit.  Make sure to try again after live migration when the quota may
-     * have been reset.
+     * limit or because CPU was stopped.  Make sure to try again when the
+     * CPU restart.
      */
-    virtio_rng_process(vrng);
 
-    return 0;
+    if (running && is_guest_ready(vrng)) {
+        virtio_rng_process(vrng);
+    }
 }
 
 static void check_rate_limit(void *opaque)
@@ -214,8 +212,9 @@ static void virtio_rng_device_realize(DeviceState *dev, Error **errp)
     vrng->rate_limit_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                                check_rate_limit, vrng);
     vrng->activate_timer = true;
-    register_savevm(dev, "virtio-rng", -1, 1, virtio_rng_save,
-                    virtio_rng_load, vrng);
+
+    vrng->vmstate = qemu_add_vm_change_state_handler(virtio_rng_vm_state_change,
+                                                     vrng);
 }
 
 static void virtio_rng_device_unrealize(DeviceState *dev, Error **errp)
@@ -223,11 +222,21 @@ static void virtio_rng_device_unrealize(DeviceState *dev, Error **errp)
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIORNG *vrng = VIRTIO_RNG(dev);
 
+    qemu_del_vm_change_state_handler(vrng->vmstate);
     timer_del(vrng->rate_limit_timer);
     timer_free(vrng->rate_limit_timer);
-    unregister_savevm(dev, "virtio-rng", vrng);
     virtio_cleanup(vdev);
 }
+
+static const VMStateDescription vmstate_virtio_rng = {
+    .name = "virtio-rng",
+    .minimum_version_id = 1,
+    .version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_VIRTIO_DEVICE,
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 static Property virtio_rng_properties[] = {
     /* Set a default rate limit of 2^47 bytes per minute or roughly 2TB/s.  If
@@ -246,6 +255,7 @@ static void virtio_rng_class_init(ObjectClass *klass, void *data)
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
 
     dc->props = virtio_rng_properties;
+    dc->vmsd = &vmstate_virtio_rng;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     vdc->realize = virtio_rng_device_realize;
     vdc->unrealize = virtio_rng_device_unrealize;

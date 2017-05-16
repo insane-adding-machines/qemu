@@ -38,7 +38,9 @@
 #include "slirp/libslirp.h"
 #include "slirp/ip6.h"
 #include "sysemu/char.h"
+#include "sysemu/sysemu.h"
 #include "qemu/cutils.h"
+#include "qapi/error.h"
 
 static int get_str_sep(char *buf, int buf_size, const char **pp, int sep)
 {
@@ -76,8 +78,9 @@ typedef struct SlirpState {
     NetClientState nc;
     QTAILQ_ENTRY(SlirpState) entry;
     Slirp *slirp;
+    Notifier exit_notifier;
 #ifndef _WIN32
-    char smb_dir[128];
+    gchar *smb_dir;
 #endif
 } SlirpState;
 
@@ -118,17 +121,26 @@ static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t 
     return size;
 }
 
+static void slirp_smb_exit(Notifier *n, void *data)
+{
+    SlirpState *s = container_of(n, SlirpState, exit_notifier);
+    slirp_smb_cleanup(s);
+}
+
 static void net_slirp_cleanup(NetClientState *nc)
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
     slirp_cleanup(s->slirp);
+    if (s->exit_notifier.notify) {
+        qemu_remove_exit_notifier(&s->exit_notifier);
+    }
     slirp_smb_cleanup(s);
     QTAILQ_REMOVE(&slirp_stacks, s, entry);
 }
 
 static NetClientInfo net_slirp_info = {
-    .type = NET_CLIENT_OPTIONS_KIND_USER,
+    .type = NET_CLIENT_DRIVER_USER,
     .size = sizeof(SlirpState),
     .receive = net_slirp_receive,
     .cleanup = net_slirp_cleanup,
@@ -349,6 +361,8 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     }
 #endif
 
+    s->exit_notifier.notify = slirp_smb_exit;
+    qemu_add_exit_notifier(&s->exit_notifier);
     return 0;
 
 error:
@@ -473,7 +487,7 @@ static int slirp_hostfwd(SlirpState *s, const char *redir_str,
         goto fail_syntax;
     }
     host_port = strtol(buf, &end, 0);
-    if (*end != '\0' || host_port < 1 || host_port > 65535) {
+    if (*end != '\0' || host_port < 0 || host_port > 65535) {
         goto fail_syntax;
     }
 
@@ -544,11 +558,10 @@ int net_slirp_redir(const char *redir_str)
 /* automatic user mode samba server configuration */
 static void slirp_smb_cleanup(SlirpState *s)
 {
-    char cmd[128];
     int ret;
 
-    if (s->smb_dir[0] != '\0') {
-        snprintf(cmd, sizeof(cmd), "rm -rf %s", s->smb_dir);
+    if (s->smb_dir) {
+        gchar *cmd = g_strdup_printf("rm -rf %s", s->smb_dir);
         ret = system(cmd);
         if (ret == -1 || !WIFEXITED(ret)) {
             error_report("'%s' failed.", cmd);
@@ -556,15 +569,17 @@ static void slirp_smb_cleanup(SlirpState *s)
             error_report("'%s' failed. Error code: %d",
                          cmd, WEXITSTATUS(ret));
         }
-        s->smb_dir[0] = '\0';
+        g_free(cmd);
+        g_free(s->smb_dir);
+        s->smb_dir = NULL;
     }
 }
 
 static int slirp_smb(SlirpState* s, const char *exported_dir,
                      struct in_addr vserver_addr)
 {
-    char smb_conf[128];
-    char smb_cmdline[128];
+    char *smb_conf;
+    char *smb_cmdline;
     struct passwd *passwd;
     FILE *f;
 
@@ -586,19 +601,19 @@ static int slirp_smb(SlirpState* s, const char *exported_dir,
         return -1;
     }
 
-    snprintf(s->smb_dir, sizeof(s->smb_dir), "/tmp/qemu-smb.XXXXXX");
-    if (!mkdtemp(s->smb_dir)) {
-        error_report("could not create samba server dir '%s'", s->smb_dir);
-        s->smb_dir[0] = 0;
+    s->smb_dir = g_dir_make_tmp("qemu-smb.XXXXXX", NULL);
+    if (!s->smb_dir) {
+        error_report("could not create samba server dir");
         return -1;
     }
-    snprintf(smb_conf, sizeof(smb_conf), "%s/%s", s->smb_dir, "smb.conf");
+    smb_conf = g_strdup_printf("%s/%s", s->smb_dir, "smb.conf");
 
     f = fopen(smb_conf, "w");
     if (!f) {
         slirp_smb_cleanup(s);
         error_report("could not create samba server configuration file '%s'",
                      smb_conf);
+        g_free(smb_conf);
         return -1;
     }
     fprintf(f,
@@ -637,15 +652,18 @@ static int slirp_smb(SlirpState* s, const char *exported_dir,
             );
     fclose(f);
 
-    snprintf(smb_cmdline, sizeof(smb_cmdline), "%s -l %s -s %s",
+    smb_cmdline = g_strdup_printf("%s -l %s -s %s",
              CONFIG_SMBD_COMMAND, s->smb_dir, smb_conf);
+    g_free(smb_conf);
 
     if (slirp_add_exec(s->slirp, 0, smb_cmdline, &vserver_addr, 139) < 0 ||
         slirp_add_exec(s->slirp, 0, smb_cmdline, &vserver_addr, 445) < 0) {
         slirp_smb_cleanup(s);
+        g_free(smb_cmdline);
         error_report("conflicting/invalid smbserver address");
         return -1;
     }
+    g_free(smb_cmdline);
     return 0;
 }
 
@@ -669,7 +687,7 @@ int net_slirp_smb(const char *exported_dir)
 #endif /* !defined(_WIN32) */
 
 struct GuestFwd {
-    CharDriverState *hd;
+    CharBackend hd;
     struct in_addr server;
     int port;
     Slirp *slirp;
@@ -733,15 +751,23 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str,
             return -1;
         }
     } else {
-        fwd = g_new(struct GuestFwd, 1);
-        fwd->hd = qemu_chr_new(buf, p, NULL);
-        if (!fwd->hd) {
+        Error *err = NULL;
+        Chardev *chr = qemu_chr_new(buf, p);
+
+        if (!chr) {
             error_report("could not open guest forwarding device '%s'", buf);
+            return -1;
+        }
+
+        fwd = g_new(struct GuestFwd, 1);
+        qemu_chr_fe_init(&fwd->hd, chr, &err);
+        if (err) {
+            error_report_err(err);
             g_free(fwd);
             return -1;
         }
 
-        if (slirp_add_exec(s->slirp, 3, fwd->hd, &server, port) < 0) {
+        if (slirp_add_exec(s->slirp, 3, &fwd->hd, &server, port) < 0) {
             error_report("conflicting/invalid host:port in guest forwarding "
                          "rule '%s'", config_str);
             g_free(fwd);
@@ -751,9 +777,8 @@ static int slirp_guestfwd(SlirpState *s, const char *config_str,
         fwd->port = port;
         fwd->slirp = s->slirp;
 
-        qemu_chr_fe_claim_no_fail(fwd->hd);
-        qemu_chr_add_handlers(fwd->hd, guestfwd_can_read, guestfwd_read,
-                              NULL, fwd);
+        qemu_chr_fe_set_handlers(&fwd->hd, guestfwd_can_read, guestfwd_read,
+                                 NULL, fwd, NULL, true);
     }
     return 0;
 
@@ -817,7 +842,7 @@ static const char **slirp_dnssearch(const StringList *dnsname)
     return ret;
 }
 
-int net_init_slirp(const NetClientOptions *opts, const char *name,
+int net_init_slirp(const Netdev *netdev, const char *name,
                    NetClientState *peer, Error **errp)
 {
     /* FIXME error_setg(errp, ...) on failure */
@@ -828,8 +853,8 @@ int net_init_slirp(const NetClientOptions *opts, const char *name,
     const char **dnssearch;
     bool ipv4 = true, ipv6 = true;
 
-    assert(opts->type == NET_CLIENT_OPTIONS_KIND_USER);
-    user = opts->u.user.data;
+    assert(netdev->type == NET_CLIENT_DRIVER_USER);
+    user = &netdev->u.user;
 
     if ((user->has_ipv6 && user->ipv6 && !user->has_ipv4) ||
         (user->has_ipv4 && !user->ipv4)) {

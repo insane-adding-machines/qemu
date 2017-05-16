@@ -438,10 +438,10 @@ static void xlnx_dp_aux_clear_tx_fifo(XlnxDPState *s)
     fifo8_reset(&s->tx_fifo);
 }
 
-static void xlnx_dp_aux_push_tx_fifo(XlnxDPState *s, uint8_t val, size_t len)
+static void xlnx_dp_aux_push_tx_fifo(XlnxDPState *s, uint8_t *buf, size_t len)
 {
     DPRINTF("Push %u data in tx_fifo\n", (unsigned)len);
-    fifo8_push_all(&s->tx_fifo, &val, len);
+    fifo8_push_all(&s->tx_fifo, buf, len);
 }
 
 static uint8_t xlnx_dp_aux_pop_tx_fifo(XlnxDPState *s)
@@ -555,7 +555,7 @@ static void xlnx_dp_recreate_surface(XlnxDPState *s)
     if ((width != 0) && (height != 0)) {
         /*
          * As dpy_gfx_replace_surface calls qemu_free_displaysurface on the
-         * surface we need to be carefull and don't free the surface associated
+         * surface we need to be careful and don't free the surface associated
          * to the console or double free will happen.
          */
         if (s->bout_plane.surface != current_console_surface) {
@@ -806,9 +806,11 @@ static void xlnx_dp_write(void *opaque, hwaddr offset, uint64_t value,
          * TODO: Power down things?
          */
         break;
-    case DP_AUX_WRITE_FIFO:
-        xlnx_dp_aux_push_tx_fifo(s, value, 1);
+    case DP_AUX_WRITE_FIFO: {
+        uint8_t c = value;
+        xlnx_dp_aux_push_tx_fifo(s, &c, 1);
         break;
+    }
     case DP_AUX_CLOCK_DIVIDER:
         break;
     case DP_AUX_REPLY_COUNT:
@@ -1158,7 +1160,7 @@ static void xlnx_dp_update_display(void *opaque)
      */
     if (!xlnx_dpdma_start_operation(s->dpdma, 3, false)) {
         /*
-         * An error occured don't do anything with the data..
+         * An error occurred don't do anything with the data..
          * Trigger an underflow interrupt.
          */
         s->core_registers[DP_INT_STATUS] |= (1 << 21);

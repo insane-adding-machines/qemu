@@ -30,9 +30,7 @@
 #include "qemu/module.h"
 #include "migration/migration.h"
 #include "qemu/bswap.h"
-#if defined(CONFIG_UUID)
-#include <uuid/uuid.h>
-#endif
+#include "qemu/uuid.h"
 
 /**************************************************************/
 
@@ -89,7 +87,7 @@ typedef struct vhd_footer {
     uint32_t    checksum;
 
     /* UUID used to identify a parent hard disk (backing file) */
-    uint8_t     uuid[16];
+    QemuUUID    uuid;
 
     uint8_t     in_saved_state;
 } QEMU_PACKED VHDFooter;
@@ -222,6 +220,12 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
     int disk_type = VHD_DYNAMIC;
     int ret;
 
+    bs->file = bdrv_open_child(NULL, options, "file", bs, &child_file,
+                               false, errp);
+    if (!bs->file) {
+        return -EINVAL;
+    }
+
     opts = qemu_opts_create(&vpc_runtime_opts, NULL, 0, &error_abort);
     qemu_opts_absorb_qdict(opts, options, &local_err);
     if (local_err) {
@@ -237,7 +241,7 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
         goto fail;
     }
 
-    ret = bdrv_pread(bs->file->bs, 0, s->footer_buf, HEADER_SIZE);
+    ret = bdrv_pread(bs->file, 0, s->footer_buf, HEADER_SIZE);
     if (ret < 0) {
         error_setg(errp, "Unable to read VHD header");
         goto fail;
@@ -257,7 +261,7 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
         }
 
         /* If a fixed disk, the footer is found only at the end of the file */
-        ret = bdrv_pread(bs->file->bs, offset-HEADER_SIZE, s->footer_buf,
+        ret = bdrv_pread(bs->file, offset-HEADER_SIZE, s->footer_buf,
                          HEADER_SIZE);
         if (ret < 0) {
             goto fail;
@@ -328,7 +332,7 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     if (disk_type == VHD_DYNAMIC) {
-        ret = bdrv_pread(bs->file->bs, be64_to_cpu(footer->data_offset), buf,
+        ret = bdrv_pread(bs->file, be64_to_cpu(footer->data_offset), buf,
                          HEADER_SIZE);
         if (ret < 0) {
             error_setg(errp, "Error reading dynamic VHD header");
@@ -385,7 +389,7 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
 
         s->bat_offset = be64_to_cpu(dyndisk_header->table_offset);
 
-        ret = bdrv_pread(bs->file->bs, s->bat_offset, s->pagetable,
+        ret = bdrv_pread(bs->file, s->bat_offset, s->pagetable,
                          pagetable_size);
         if (ret < 0) {
             error_setg(errp, "Error reading pagetable");
@@ -424,13 +428,18 @@ static int vpc_open(BlockDriverState *bs, QDict *options, int flags,
 #endif
     }
 
-    qemu_co_mutex_init(&s->lock);
-
     /* Disable migration when VHD images are used */
     error_setg(&s->migration_blocker, "The vpc format used by node '%s' "
                "does not support live migration",
                bdrv_get_device_or_node_name(bs));
-    migrate_add_blocker(s->migration_blocker);
+    ret = migrate_add_blocker(s->migration_blocker, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        error_free(s->migration_blocker);
+        goto fail;
+    }
+
+    qemu_co_mutex_init(&s->lock);
 
     return 0;
 
@@ -481,7 +490,7 @@ static inline int64_t get_image_offset(BlockDriverState *bs, uint64_t offset,
 
         s->last_bitmap_offset = bitmap_offset;
         memset(bitmap, 0xff, s->bitmap_size);
-        bdrv_pwrite_sync(bs->file->bs, bitmap_offset, bitmap, s->bitmap_size);
+        bdrv_pwrite_sync(bs->file, bitmap_offset, bitmap, s->bitmap_size);
     }
 
     return block_offset;
@@ -505,7 +514,7 @@ static int rewrite_footer(BlockDriverState* bs)
     BDRVVPCState *s = bs->opaque;
     int64_t offset = s->free_data_block_offset;
 
-    ret = bdrv_pwrite_sync(bs->file->bs, offset, s->footer_buf, HEADER_SIZE);
+    ret = bdrv_pwrite_sync(bs->file, offset, s->footer_buf, HEADER_SIZE);
     if (ret < 0)
         return ret;
 
@@ -539,7 +548,7 @@ static int64_t alloc_block(BlockDriverState* bs, int64_t offset)
 
     /* Initialize the block's bitmap */
     memset(bitmap, 0xff, s->bitmap_size);
-    ret = bdrv_pwrite_sync(bs->file->bs, s->free_data_block_offset, bitmap,
+    ret = bdrv_pwrite_sync(bs->file, s->free_data_block_offset, bitmap,
         s->bitmap_size);
     if (ret < 0) {
         return ret;
@@ -554,7 +563,7 @@ static int64_t alloc_block(BlockDriverState* bs, int64_t offset)
     /* Write BAT entry to disk */
     bat_offset = s->bat_offset + (4 * index);
     bat_value = cpu_to_be32(s->pagetable[index]);
-    ret = bdrv_pwrite_sync(bs->file->bs, bat_offset, &bat_value, 4);
+    ret = bdrv_pwrite_sync(bs->file, bat_offset, &bat_value, 4);
     if (ret < 0)
         goto fail;
 
@@ -591,7 +600,7 @@ vpc_co_preadv(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
     QEMUIOVector local_qiov;
 
     if (be32_to_cpu(footer->type) == VHD_FIXED) {
-        return bdrv_co_preadv(bs->file->bs, offset, bytes, qiov, 0);
+        return bdrv_co_preadv(bs->file, offset, bytes, qiov, 0);
     }
 
     qemu_co_mutex_lock(&s->lock);
@@ -607,7 +616,7 @@ vpc_co_preadv(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
             qemu_iovec_reset(&local_qiov);
             qemu_iovec_concat(&local_qiov, qiov, bytes_done, n_bytes);
 
-            ret = bdrv_co_preadv(bs->file->bs, image_offset, n_bytes,
+            ret = bdrv_co_preadv(bs->file, image_offset, n_bytes,
                                  &local_qiov, 0);
             if (ret < 0) {
                 goto fail;
@@ -640,7 +649,7 @@ vpc_co_pwritev(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
     QEMUIOVector local_qiov;
 
     if (be32_to_cpu(footer->type) == VHD_FIXED) {
-        return bdrv_co_pwritev(bs->file->bs, offset, bytes, qiov, 0);
+        return bdrv_co_pwritev(bs->file, offset, bytes, qiov, 0);
     }
 
     qemu_co_mutex_lock(&s->lock);
@@ -661,7 +670,7 @@ vpc_co_pwritev(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
         qemu_iovec_reset(&local_qiov);
         qemu_iovec_concat(&local_qiov, qiov, bytes_done, n_bytes);
 
-        ret = bdrv_co_pwritev(bs->file->bs, image_offset, n_bytes,
+        ret = bdrv_co_pwritev(bs->file, image_offset, n_bytes,
                               &local_qiov, 0);
         if (ret < 0) {
             goto fail;
@@ -842,20 +851,21 @@ static int create_dynamic_disk(BlockBackend *blk, uint8_t *buf,
 }
 
 static int create_fixed_disk(BlockBackend *blk, uint8_t *buf,
-                             int64_t total_size)
+                             int64_t total_size, Error **errp)
 {
     int ret;
 
     /* Add footer to total size */
     total_size += HEADER_SIZE;
 
-    ret = blk_truncate(blk, total_size);
+    ret = blk_truncate(blk, total_size, errp);
     if (ret < 0) {
         return ret;
     }
 
     ret = blk_pwrite(blk, total_size - HEADER_SIZE, buf, HEADER_SIZE, 0);
     if (ret < 0) {
+        error_setg_errno(errp, -ret, "Unable to write VHD header");
         return ret;
     }
 
@@ -906,7 +916,8 @@ static int vpc_create(const char *filename, QemuOpts *opts, Error **errp)
     }
 
     blk = blk_new_open(filename, NULL, NULL,
-                       BDRV_O_RDWR | BDRV_O_PROTOCOL, &local_err);
+                       BDRV_O_RDWR | BDRV_O_RESIZE | BDRV_O_PROTOCOL,
+                       &local_err);
     if (blk == NULL) {
         error_propagate(errp, local_err);
         ret = -EIO;
@@ -980,19 +991,17 @@ static int vpc_create(const char *filename, QemuOpts *opts, Error **errp)
 
     footer->type = cpu_to_be32(disk_type);
 
-#if defined(CONFIG_UUID)
-    uuid_generate(footer->uuid);
-#endif
+    qemu_uuid_generate(&footer->uuid);
 
     footer->checksum = cpu_to_be32(vpc_checksum(buf, HEADER_SIZE));
 
     if (disk_type == VHD_DYNAMIC) {
         ret = create_dynamic_disk(blk, buf, total_sectors);
+        if (ret < 0) {
+            error_setg(errp, "Unable to create or write VHD header");
+        }
     } else {
-        ret = create_fixed_disk(blk, buf, total_size);
-    }
-    if (ret < 0) {
-        error_setg(errp, "Unable to create or write VHD header");
+        ret = create_fixed_disk(blk, buf, total_size, errp);
     }
 
 out:
@@ -1060,6 +1069,7 @@ static BlockDriver bdrv_vpc = {
     .bdrv_open              = vpc_open,
     .bdrv_close             = vpc_close,
     .bdrv_reopen_prepare    = vpc_reopen_prepare,
+    .bdrv_child_perm        = bdrv_format_default_perms,
     .bdrv_create            = vpc_create,
 
     .bdrv_co_preadv             = vpc_co_preadv,

@@ -9,8 +9,8 @@
  * top-level directory.
  */
 
-#ifndef _QEMU_VIRTIO_RNG_H
-#define _QEMU_VIRTIO_RNG_H
+#ifndef QEMU_VIRTIO_RNG_H
+#define QEMU_VIRTIO_RNG_H
 
 #include "sysemu/rng.h"
 #include "sysemu/rng-random.h"
@@ -45,6 +45,8 @@ typedef struct VirtIORNG {
     QEMUTimer *rate_limit_timer;
     int64_t quota_remaining;
     bool activate_timer;
+
+    VMChangeStateEntry *vmstate;
 } VirtIORNG;
 
 #endif

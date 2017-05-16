@@ -12,7 +12,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
-#include <hw/qdev.h>
+#include "hw/qdev.h"
 #include "qemu/bitops.h"
 #include "exec/address-spaces.h"
 #include "cpu.h"
@@ -47,7 +47,6 @@ typedef struct IoAdapter {
     uint32_t id;
     uint8_t type;
     uint8_t isc;
-    QTAILQ_ENTRY(IoAdapter) sibling;
 } IoAdapter;
 
 typedef struct ChannelSubSys {
@@ -61,7 +60,7 @@ typedef struct ChannelSubSys {
     uint64_t chnmon_area;
     CssImage *css[MAX_CSSID + 1];
     uint8_t default_cssid;
-    QTAILQ_HEAD(, IoAdapter) io_adapters;
+    IoAdapter *io_adapters[CSS_IO_ADAPTER_TYPE_NUMS][MAX_ISC + 1];
     QTAILQ_HEAD(, IndAddr) indicator_addresses;
 } ChannelSubSys;
 
@@ -72,7 +71,6 @@ static ChannelSubSys channel_subsys = {
     .do_crw_mchk = true,
     .crws_lost = false,
     .chnmon_active = false,
-    .io_adapters = QTAILQ_HEAD_INITIALIZER(channel_subsys.io_adapters),
     .indicator_addresses =
         QTAILQ_HEAD_INITIALIZER(channel_subsys.indicator_addresses),
 };
@@ -141,7 +139,8 @@ out_err:
 int css_create_css_image(uint8_t cssid, bool default_image)
 {
     trace_css_new_image(cssid, default_image ? "(default)" : "");
-    if (cssid > MAX_CSSID) {
+    /* 255 is reserved */
+    if (cssid == 255) {
         return -EINVAL;
     }
     if (channel_subsys.css[cssid]) {
@@ -154,44 +153,67 @@ int css_create_css_image(uint8_t cssid, bool default_image)
     return 0;
 }
 
-int css_register_io_adapter(uint8_t type, uint8_t isc, bool swap,
-                            bool maskable, uint32_t *id)
+uint32_t css_get_adapter_id(CssIoAdapterType type, uint8_t isc)
 {
+    if (type >= CSS_IO_ADAPTER_TYPE_NUMS || isc > MAX_ISC ||
+        !channel_subsys.io_adapters[type][isc]) {
+        return -1;
+    }
+
+    return channel_subsys.io_adapters[type][isc]->id;
+}
+
+/**
+ * css_register_io_adapters: Register I/O adapters per ISC during init
+ *
+ * @swap: an indication if byte swap is needed.
+ * @maskable: an indication if the adapter is subject to the mask operation.
+ * @errp: location to store error information.
+ */
+void css_register_io_adapters(CssIoAdapterType type, bool swap, bool maskable,
+                              Error **errp)
+{
+    uint32_t id;
+    int ret, isc;
     IoAdapter *adapter;
-    bool found = false;
-    int ret;
     S390FLICState *fs = s390_get_flic();
     S390FLICStateClass *fsc = S390_FLIC_COMMON_GET_CLASS(fs);
 
-    *id = 0;
-    QTAILQ_FOREACH(adapter, &channel_subsys.io_adapters, sibling) {
-        if ((adapter->type == type) && (adapter->isc == isc)) {
-            *id = adapter->id;
-            found = true;
-            ret = 0;
+    /*
+     * Disallow multiple registrations for the same device type.
+     * Report an error if registering for an already registered type.
+     */
+    if (channel_subsys.io_adapters[type][0]) {
+        error_setg(errp, "Adapters for type %d already registered", type);
+    }
+
+    for (isc = 0; isc <= MAX_ISC; isc++) {
+        id = (type << 3) | isc;
+        ret = fsc->register_io_adapter(fs, id, isc, swap, maskable);
+        if (ret == 0) {
+            adapter = g_new0(IoAdapter, 1);
+            adapter->id = id;
+            adapter->isc = isc;
+            adapter->type = type;
+            channel_subsys.io_adapters[type][isc] = adapter;
+        } else {
+            error_setg_errno(errp, -ret, "Unexpected error %d when "
+                             "registering adapter %d", ret, id);
             break;
         }
-        if (adapter->id >= *id) {
-            *id = adapter->id + 1;
+    }
+
+    /*
+     * No need to free registered adapters in kvm: kvm will clean up
+     * when the machine goes away.
+     */
+    if (ret) {
+        for (isc--; isc >= 0; isc--) {
+            g_free(channel_subsys.io_adapters[type][isc]);
+            channel_subsys.io_adapters[type][isc] = NULL;
         }
     }
-    if (found) {
-        goto out;
-    }
-    adapter = g_new0(IoAdapter, 1);
-    ret = fsc->register_io_adapter(fs, *id, isc, swap, maskable);
-    if (ret == 0) {
-        adapter->id = *id;
-        adapter->isc = isc;
-        adapter->type = type;
-        QTAILQ_INSERT_TAIL(&channel_subsys.io_adapters, adapter, sibling);
-    } else {
-        g_free(adapter);
-        fprintf(stderr, "Unexpected error %d when registering adapter %d\n",
-                ret, *id);
-    }
-out:
-    return ret;
+
 }
 
 static void css_clear_io_interrupt(uint16_t subchannel_id,
@@ -367,13 +389,16 @@ static CCW1 copy_ccw_from_guest(hwaddr addr, bool fmt1)
         ret.cda = be32_to_cpu(tmp1.cda);
     } else {
         cpu_physical_memory_read(addr, &tmp0, sizeof(tmp0));
-        ret.cmd_code = tmp0.cmd_code;
-        ret.flags = tmp0.flags;
-        ret.count = be16_to_cpu(tmp0.count);
-        ret.cda = be16_to_cpu(tmp0.cda1) | (tmp0.cda0 << 16);
-        if ((ret.cmd_code & 0x0f) == CCW_CMD_TIC) {
-            ret.cmd_code &= 0x0f;
+        if ((tmp0.cmd_code & 0x0f) == CCW_CMD_TIC) {
+            ret.cmd_code = CCW_CMD_TIC;
+            ret.flags = 0;
+            ret.count = 0;
+        } else {
+            ret.cmd_code = tmp0.cmd_code;
+            ret.flags = tmp0.flags;
+            ret.count = be16_to_cpu(tmp0.count);
         }
+        ret.cda = be16_to_cpu(tmp0.cda1) | (tmp0.cda0 << 16);
     }
     return ret;
 }
@@ -511,6 +536,7 @@ static void sch_handle_start_func(SubchDev *sch, ORB *orb)
     path = 0x80;
 
     if (!(s->ctrl & SCSW_ACTL_SUSP)) {
+        /* Start Function triggered via ssch, i.e. we have an ORB */
         s->cstat = 0;
         s->dstat = 0;
         /* Look at the orb and try to execute the channel program. */
@@ -524,9 +550,12 @@ static void sch_handle_start_func(SubchDev *sch, ORB *orb)
             return;
         }
         sch->ccw_fmt_1 = !!(orb->ctrl0 & ORB_CTRL0_MASK_FMT);
+        s->flags |= (sch->ccw_fmt_1) ? SCSW_FLAGS_MASK_FMT : 0;
         sch->ccw_no_data_cnt = 0;
         suspend_allowed = !!(orb->ctrl0 & ORB_CTRL0_MASK_SPND);
     } else {
+        /* Start Function resumed via rsch, i.e. we don't have an
+         * ORB */
         s->ctrl &= ~(SCSW_ACTL_SUSP | SCSW_ACTL_RESUME_PEND);
         /* The channel program had been suspended before. */
         suspend_allowed = true;
@@ -546,6 +575,9 @@ static void sch_handle_start_func(SubchDev *sch, ORB *orb)
                     SCSW_STCTL_STATUS_PEND;
             s->dstat = SCSW_DSTAT_CHANNEL_END | SCSW_DSTAT_DEVICE_END;
             s->cpa = sch->channel_prog + 8;
+            break;
+        case -EIO:
+            /* I/O errors, status depends on specific devices */
             break;
         case -ENOSYS:
             /* unsupported command, generate unit check (command reject) */
@@ -609,6 +641,7 @@ static void do_subchannel_work(SubchDev *sch, ORB *orb)
     } else if (s->ctrl & SCSW_FCTL_HALT_FUNC) {
         sch_handle_halt_func(sch);
     } else if (s->ctrl & SCSW_FCTL_START_FUNC) {
+        /* Triggered by both ssch and rsch. */
         sch_handle_start_func(sch, orb);
     } else {
         /* Cannot happen. */
@@ -769,7 +802,7 @@ int css_do_xsch(SubchDev *sch)
     PMCW *p = &sch->curr_status.pmcw;
     int ret;
 
-    if (!(p->flags & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA))) {
+    if (~(p->flags) & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) {
         ret = -ENODEV;
         goto out;
     }
@@ -809,7 +842,7 @@ int css_do_csch(SubchDev *sch)
     PMCW *p = &sch->curr_status.pmcw;
     int ret;
 
-    if (!(p->flags & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA))) {
+    if (~(p->flags) & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) {
         ret = -ENODEV;
         goto out;
     }
@@ -831,7 +864,7 @@ int css_do_hsch(SubchDev *sch)
     PMCW *p = &sch->curr_status.pmcw;
     int ret;
 
-    if (!(p->flags & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA))) {
+    if (~(p->flags) & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) {
         ret = -ENODEV;
         goto out;
     }
@@ -907,7 +940,7 @@ int css_do_ssch(SubchDev *sch, ORB *orb)
     PMCW *p = &sch->curr_status.pmcw;
     int ret;
 
-    if (!(p->flags & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA))) {
+    if (~(p->flags) & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) {
         ret = -ENODEV;
         goto out;
     }
@@ -984,7 +1017,7 @@ int css_do_tsch_get_irb(SubchDev *sch, IRB *target_irb, int *irb_len)
     uint16_t stctl;
     IRB irb;
 
-    if (!(p->flags & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA))) {
+    if (~(p->flags) & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) {
         return 3;
     }
 
@@ -1190,7 +1223,7 @@ int css_do_rsch(SubchDev *sch)
     PMCW *p = &sch->curr_status.pmcw;
     int ret;
 
-    if (!(p->flags & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA))) {
+    if (~(p->flags) & (PMCW_FLAGS_MASK_DNV | PMCW_FLAGS_MASK_ENA)) {
         ret = -ENODEV;
         goto out;
     }
@@ -1262,7 +1295,7 @@ bool css_schid_final(int m, uint8_t cssid, uint8_t ssid, uint16_t schid)
     uint8_t real_cssid;
 
     real_cssid = (!m && (cssid == 0)) ? channel_subsys.default_cssid : cssid;
-    if (real_cssid > MAX_CSSID || ssid > MAX_SSID ||
+    if (ssid > MAX_SSID ||
         !channel_subsys.css[real_cssid] ||
         !channel_subsys.css[real_cssid]->sch_set[ssid]) {
         return true;
@@ -1272,14 +1305,32 @@ bool css_schid_final(int m, uint8_t cssid, uint8_t ssid, uint16_t schid)
                                  (MAX_SCHID + 1) / sizeof(unsigned long));
 }
 
+unsigned int css_find_free_chpid(uint8_t cssid)
+{
+    CssImage *css = channel_subsys.css[cssid];
+    unsigned int chpid;
+
+    if (!css) {
+        return MAX_CHPID + 1;
+    }
+
+    for (chpid = 0; chpid <= MAX_CHPID; chpid++) {
+        /* skip reserved chpid */
+        if (chpid == VIRTIO_CCW_CHPID) {
+            continue;
+        }
+        if (!css->chpids[chpid].in_use) {
+            return chpid;
+        }
+    }
+    return MAX_CHPID + 1;
+}
+
 static int css_add_virtual_chpid(uint8_t cssid, uint8_t chpid, uint8_t type)
 {
     CssImage *css;
 
     trace_css_chpid_add(cssid, chpid, type);
-    if (cssid > MAX_CSSID) {
-        return -EINVAL;
-    }
     css = channel_subsys.css[cssid];
     if (!css) {
         return -EINVAL;
@@ -1338,6 +1389,116 @@ SubchDev *css_find_subch(uint8_t m, uint8_t cssid, uint8_t ssid, uint16_t schid)
     }
 
     return channel_subsys.css[real_cssid]->sch_set[ssid]->sch[schid];
+}
+
+/**
+ * Return free device number in subchannel set.
+ *
+ * Return index of the first free device number in the subchannel set
+ * identified by @p cssid and @p ssid, beginning the search at @p
+ * start and wrapping around at MAX_DEVNO. Return a value exceeding
+ * MAX_SCHID if there are no free device numbers in the subchannel
+ * set.
+ */
+static uint32_t css_find_free_devno(uint8_t cssid, uint8_t ssid,
+                                    uint16_t start)
+{
+    uint32_t round;
+
+    for (round = 0; round <= MAX_DEVNO; round++) {
+        uint16_t devno = (start + round) % MAX_DEVNO;
+
+        if (!css_devno_used(cssid, ssid, devno)) {
+            return devno;
+        }
+    }
+    return MAX_DEVNO + 1;
+}
+
+/**
+ * Return first free subchannel (id) in subchannel set.
+ *
+ * Return index of the first free subchannel in the subchannel set
+ * identified by @p cssid and @p ssid, if there is any. Return a value
+ * exceeding MAX_SCHID if there are no free subchannels in the
+ * subchannel set.
+ */
+static uint32_t css_find_free_subch(uint8_t cssid, uint8_t ssid)
+{
+    uint32_t schid;
+
+    for (schid = 0; schid <= MAX_SCHID; schid++) {
+        if (!css_find_subch(1, cssid, ssid, schid)) {
+            return schid;
+        }
+    }
+    return MAX_SCHID + 1;
+}
+
+/**
+ * Return first free subchannel (id) in subchannel set for a device number
+ *
+ * Verify the device number @p devno is not used yet in the subchannel
+ * set identified by @p cssid and @p ssid. Set @p schid to the index
+ * of the first free subchannel in the subchannel set, if there is
+ * any. Return true if everything succeeded and false otherwise.
+ */
+static bool css_find_free_subch_for_devno(uint8_t cssid, uint8_t ssid,
+                                          uint16_t devno, uint16_t *schid,
+                                          Error **errp)
+{
+    uint32_t free_schid;
+
+    assert(schid);
+    if (css_devno_used(cssid, ssid, devno)) {
+        error_setg(errp, "Device %x.%x.%04x already exists",
+                   cssid, ssid, devno);
+        return false;
+    }
+    free_schid = css_find_free_subch(cssid, ssid);
+    if (free_schid > MAX_SCHID) {
+        error_setg(errp, "No free subchannel found for %x.%x.%04x",
+                   cssid, ssid, devno);
+        return false;
+    }
+    *schid = free_schid;
+    return true;
+}
+
+/**
+ * Return first free subchannel (id) and device number
+ *
+ * Locate the first free subchannel and first free device number in
+ * any of the subchannel sets of the channel subsystem identified by
+ * @p cssid. Return false if no free subchannel / device number could
+ * be found. Otherwise set @p ssid, @p devno and @p schid to identify
+ * the available subchannel and device number and return true.
+ *
+ * May modify @p ssid, @p devno and / or @p schid even if no free
+ * subchannel / device number could be found.
+ */
+static bool css_find_free_subch_and_devno(uint8_t cssid, uint8_t *ssid,
+                                          uint16_t *devno, uint16_t *schid,
+                                          Error **errp)
+{
+    uint32_t free_schid, free_devno;
+
+    assert(ssid && devno && schid);
+    for (*ssid = 0; *ssid <= MAX_SSID; (*ssid)++) {
+        free_schid = css_find_free_subch(cssid, *ssid);
+        if (free_schid > MAX_SCHID) {
+            continue;
+        }
+        free_devno = css_find_free_devno(cssid, *ssid, free_schid);
+        if (free_devno > MAX_DEVNO) {
+            continue;
+        }
+        *schid = free_schid;
+        *devno = free_devno;
+        return true;
+    }
+    error_setg(errp, "Virtual channel subsystem is full!");
+    return false;
 }
 
 bool css_subch_visible(SubchDev *sch)
@@ -1559,12 +1720,27 @@ void subch_device_save(SubchDev *s, QEMUFile *f)
 
 int subch_device_load(SubchDev *s, QEMUFile *f)
 {
+    SubchDev *old_s;
+    uint16_t old_schid = s->schid;
     int i;
 
     s->cssid = qemu_get_byte(f);
     s->ssid = qemu_get_byte(f);
     s->schid = qemu_get_be16(f);
     s->devno = qemu_get_be16(f);
+    /* Re-assign subch. */
+    if (old_schid != s->schid) {
+        old_s = channel_subsys.css[s->cssid]->sch_set[s->ssid]->sch[old_schid];
+        /*
+         * (old_s != s) means that some other device has its correct
+         * subchannel already assigned (in load).
+         */
+        if (old_s == s) {
+            css_subch_assign(s->cssid, s->ssid, old_schid, s->devno, NULL);
+        }
+        /* It's OK to re-assign without a prior de-assign. */
+        css_subch_assign(s->cssid, s->ssid, s->schid, s->devno, s);
+    }
     s->thinint_active = qemu_get_byte(f);
     /* SCHIB */
     /*     PMCW */
@@ -1762,3 +1938,43 @@ PropertyInfo css_devid_propinfo = {
     .get = get_css_devid,
     .set = set_css_devid,
 };
+
+PropertyInfo css_devid_ro_propinfo = {
+    .name = "str",
+    .description = "Read-only identifier of an I/O device in the channel "
+                   "subsystem, example: fe.1.23ab",
+    .get = get_css_devid,
+};
+
+SubchDev *css_create_virtual_sch(CssDevId bus_id, Error **errp)
+{
+    uint16_t schid = 0;
+    SubchDev *sch;
+
+    if (bus_id.valid) {
+        /* Enforce use of virtual cssid. */
+        if (bus_id.cssid != VIRTUAL_CSSID) {
+            error_setg(errp, "cssid %hhx not valid for virtual devices",
+                       bus_id.cssid);
+            return NULL;
+        }
+        if (!css_find_free_subch_for_devno(bus_id.cssid, bus_id.ssid,
+                                           bus_id.devid, &schid, errp)) {
+            return NULL;
+        }
+    } else {
+        bus_id.cssid = VIRTUAL_CSSID;
+        if (!css_find_free_subch_and_devno(bus_id.cssid, &bus_id.ssid,
+                                           &bus_id.devid, &schid, errp)) {
+            return NULL;
+        }
+    }
+
+    sch = g_malloc0(sizeof(*sch));
+    sch->cssid = bus_id.cssid;
+    sch->ssid = bus_id.ssid;
+    sch->devno = bus_id.devid;
+    sch->schid = schid;
+    css_subch_assign(sch->cssid, sch->ssid, schid, sch->devno, sch);
+    return sch;
+}

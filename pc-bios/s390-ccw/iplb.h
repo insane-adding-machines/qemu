@@ -13,7 +13,8 @@
 #define IPLB_H
 
 struct IplBlockCcw {
-    uint8_t  reserved0[85];
+    uint64_t netboot_start_addr;
+    uint8_t  reserved0[77];
     uint8_t  ssid;
     uint16_t devno;
     uint8_t  vm_flags;
@@ -43,6 +44,16 @@ struct IplBlockFcp {
 } __attribute__ ((packed));
 typedef struct IplBlockFcp IplBlockFcp;
 
+struct IplBlockQemuScsi {
+    uint32_t lun;
+    uint16_t target;
+    uint16_t channel;
+    uint8_t  reserved0[77];
+    uint8_t  ssid;
+    uint16_t devno;
+} __attribute__ ((packed));
+typedef struct IplBlockQemuScsi IplBlockQemuScsi;
+
 struct IplParameterBlock {
     uint32_t len;
     uint8_t  reserved0[3];
@@ -55,6 +66,7 @@ struct IplParameterBlock {
     union {
         IplBlockCcw ccw;
         IplBlockFcp fcp;
+        IplBlockQemuScsi scsi;
     };
 } __attribute__ ((packed));
 typedef struct IplParameterBlock IplParameterBlock;
@@ -63,6 +75,7 @@ extern IplParameterBlock iplb __attribute__((__aligned__(PAGE_SIZE)));
 
 #define S390_IPL_TYPE_FCP 0x00
 #define S390_IPL_TYPE_CCW 0x02
+#define S390_IPL_TYPE_QEMU_SCSI 0xff
 
 static inline bool store_iplb(IplParameterBlock *iplb)
 {

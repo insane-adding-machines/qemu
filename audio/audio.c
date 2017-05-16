@@ -28,6 +28,7 @@
 #include "qemu/timer.h"
 #include "sysemu/sysemu.h"
 #include "qemu/cutils.h"
+#include "sysemu/replay.h"
 
 #define AUDIO_CAP "audio"
 #include "audio_int.h"
@@ -1112,7 +1113,7 @@ static int audio_is_timer_needed (void)
 static void audio_reset_timer (AudioState *s)
 {
     if (audio_is_timer_needed ()) {
-        timer_mod (s->ts,
+        timer_mod_anticipate_ns(s->ts,
             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + conf.period.ticks);
     }
     else {
@@ -1387,6 +1388,7 @@ static void audio_run_out (AudioState *s)
 
         prev_rpos = hw->rpos;
         played = hw->pcm_ops->run_out (hw, live);
+        replay_audio_out(&played);
         if (audio_bug (AUDIO_FUNC, hw->rpos >= hw->samples)) {
             dolog ("hw->rpos=%d hw->samples=%d played=%d\n",
                    hw->rpos, hw->samples, played);
@@ -1450,9 +1452,12 @@ static void audio_run_in (AudioState *s)
 
     while ((hw = audio_pcm_hw_find_any_enabled_in (hw))) {
         SWVoiceIn *sw;
-        int captured, min;
+        int captured = 0, min;
 
-        captured = hw->pcm_ops->run_in (hw);
+        if (replay_mode != REPLAY_MODE_PLAY) {
+            captured = hw->pcm_ops->run_in(hw);
+        }
+        replay_audio_in(&captured, hw->conv_buf, &hw->wpos, hw->samples);
 
         min = audio_pcm_hw_find_min_in (hw);
         hw->total_samples_captured += captured - min;
@@ -1739,13 +1744,21 @@ static void audio_vm_change_state_handler (void *opaque, int running,
     audio_reset_timer (s);
 }
 
-static void audio_atexit (void)
+static bool is_cleaning_up;
+
+bool audio_is_cleaning_up(void)
+{
+    return is_cleaning_up;
+}
+
+void audio_cleanup(void)
 {
     AudioState *s = &glob_audio_state;
-    HWVoiceOut *hwo = NULL;
-    HWVoiceIn *hwi = NULL;
+    HWVoiceOut *hwo, *hwon;
+    HWVoiceIn *hwi, *hwin;
 
-    while ((hwo = audio_pcm_hw_find_any_out (hwo))) {
+    is_cleaning_up = true;
+    QLIST_FOREACH_SAFE(hwo, &glob_audio_state.hw_head_out, entries, hwon) {
         SWVoiceCap *sc;
 
         if (hwo->enabled) {
@@ -1761,17 +1774,20 @@ static void audio_atexit (void)
                 cb->ops.destroy (cb->opaque);
             }
         }
+        QLIST_REMOVE(hwo, entries);
     }
 
-    while ((hwi = audio_pcm_hw_find_any_in (hwi))) {
+    QLIST_FOREACH_SAFE(hwi, &glob_audio_state.hw_head_in, entries, hwin) {
         if (hwi->enabled) {
             hwi->pcm_ops->ctl_in (hwi, VOICE_DISABLE);
         }
         hwi->pcm_ops->fini_in (hwi);
+        QLIST_REMOVE(hwi, entries);
     }
 
     if (s->drv) {
         s->drv->fini (s->drv_opaque);
+        s->drv = NULL;
     }
 }
 
@@ -1799,7 +1815,7 @@ static void audio_init (void)
     QLIST_INIT (&s->hw_head_out);
     QLIST_INIT (&s->hw_head_in);
     QLIST_INIT (&s->cap_head);
-    atexit (audio_atexit);
+    atexit(audio_cleanup);
 
     s->ts = timer_new_ns(QEMU_CLOCK_VIRTUAL, audio_timer, s);
 
@@ -1966,8 +1982,7 @@ CaptureVoiceOut *AUD_add_capture (
         QLIST_INSERT_HEAD (&s->cap_head, cap, entries);
         QLIST_INSERT_HEAD (&cap->cb_head, cb, entries);
 
-        hw = NULL;
-        while ((hw = audio_pcm_hw_find_any_out (hw))) {
+        QLIST_FOREACH(hw, &glob_audio_state.hw_head_out, entries) {
             audio_attach_capture (hw);
         }
         return cap;
@@ -2013,6 +2028,8 @@ void AUD_del_capture (CaptureVoiceOut *cap, void *cb_opaque)
                     sw = sw1;
                 }
                 QLIST_REMOVE (cap, entries);
+                g_free (cap->hw.mix_buf);
+                g_free (cap->buf);
                 g_free (cap);
             }
             return;

@@ -43,6 +43,7 @@
 #define HEADER_MAGIC2 "WithouFreSpacExt"
 #define HEADER_VERSION 2
 #define HEADER_INUSE_MAGIC  (0x746F6E59)
+#define MAX_PARALLELS_IMAGE_FACTOR (1ull << 32)
 
 #define DEFAULT_CLUSTER_SIZE 1048576        /* 1 MiB */
 
@@ -113,7 +114,7 @@ static QemuOptsList parallels_runtime_opts = {
             .name = PARALLELS_OPT_PREALLOC_SIZE,
             .type = QEMU_OPT_SIZE,
             .help = "Preallocation size on image expansion",
-            .def_value_str = "128MiB",
+            .def_value_str = "128M",
         },
         {
             .name = PARALLELS_OPT_PREALLOC_MODE,
@@ -191,8 +192,7 @@ static int64_t allocate_clusters(BlockDriverState *bs, int64_t sector_num,
                                  int nb_sectors, int *pnum)
 {
     BDRVParallelsState *s = bs->opaque;
-    uint32_t idx, to_allocate, i;
-    int64_t pos, space;
+    int64_t pos, space, idx, to_allocate, i;
 
     pos = block_status(s, sector_num, nb_sectors, pnum);
     if (pos > 0) {
@@ -200,22 +200,31 @@ static int64_t allocate_clusters(BlockDriverState *bs, int64_t sector_num,
     }
 
     idx = sector_num / s->tracks;
-    if (idx >= s->bat_size) {
-        return -EINVAL;
-    }
-
     to_allocate = DIV_ROUND_UP(sector_num + *pnum, s->tracks) - idx;
+
+    /* This function is called only by parallels_co_writev(), which will never
+     * pass a sector_num at or beyond the end of the image (because the block
+     * layer never passes such a sector_num to that function). Therefore, idx
+     * is always below s->bat_size.
+     * block_status() will limit *pnum so that sector_num + *pnum will not
+     * exceed the image end. Therefore, idx + to_allocate cannot exceed
+     * s->bat_size.
+     * Note that s->bat_size is an unsigned int, therefore idx + to_allocate
+     * will always fit into a uint32_t. */
+    assert(idx < s->bat_size && idx + to_allocate <= s->bat_size);
+
     space = to_allocate * s->tracks;
     if (s->data_end + space > bdrv_getlength(bs->file->bs) >> BDRV_SECTOR_BITS) {
         int ret;
         space += s->prealloc_size;
         if (s->prealloc_mode == PRL_PREALLOC_MODE_FALLOCATE) {
-            ret = bdrv_pwrite_zeroes(bs->file->bs,
+            ret = bdrv_pwrite_zeroes(bs->file,
                                      s->data_end << BDRV_SECTOR_BITS,
                                      space << BDRV_SECTOR_BITS, 0);
         } else {
-            ret = bdrv_truncate(bs->file->bs,
-                                (s->data_end + space) << BDRV_SECTOR_BITS);
+            ret = bdrv_truncate(bs->file,
+                                (s->data_end + space) << BDRV_SECTOR_BITS,
+                                NULL);
         }
         if (ret < 0) {
             return ret;
@@ -250,7 +259,7 @@ static coroutine_fn int parallels_co_flush_to_os(BlockDriverState *bs)
         if (off + to_write > s->header_size) {
             to_write = s->header_size - off;
         }
-        ret = bdrv_pwrite(bs->file->bs, off, (uint8_t *)s->header + off,
+        ret = bdrv_pwrite(bs->file, off, (uint8_t *)s->header + off,
                           to_write);
         if (ret < 0) {
             qemu_co_mutex_unlock(&s->lock);
@@ -311,7 +320,7 @@ static coroutine_fn int parallels_co_writev(BlockDriverState *bs,
         qemu_iovec_reset(&hd_qiov);
         qemu_iovec_concat(&hd_qiov, qiov, bytes_done, nbytes);
 
-        ret = bdrv_co_writev(bs->file->bs, position, n, &hd_qiov);
+        ret = bdrv_co_writev(bs->file, position, n, &hd_qiov);
         if (ret < 0) {
             break;
         }
@@ -351,7 +360,7 @@ static coroutine_fn int parallels_co_readv(BlockDriverState *bs,
             qemu_iovec_reset(&hd_qiov);
             qemu_iovec_concat(&hd_qiov, qiov, bytes_done, nbytes);
 
-            ret = bdrv_co_readv(bs->file->bs, position, n, &hd_qiov);
+            ret = bdrv_co_readv(bs->file, position, n, &hd_qiov);
             if (ret < 0) {
                 break;
             }
@@ -432,7 +441,7 @@ static int parallels_check(BlockDriverState *bs, BdrvCheckResult *res,
     }
 
     if (flush_bat) {
-        ret = bdrv_pwrite_sync(bs->file->bs, 0, s->header, s->header_size);
+        ret = bdrv_pwrite_sync(bs->file, 0, s->header, s->header_size);
         if (ret < 0) {
             res->check_errors++;
             return ret;
@@ -448,8 +457,10 @@ static int parallels_check(BlockDriverState *bs, BdrvCheckResult *res,
                 size - res->image_end_offset);
         res->leaks += count;
         if (fix & BDRV_FIX_LEAKS) {
-            ret = bdrv_truncate(bs->file->bs, res->image_end_offset);
+            Error *local_err = NULL;
+            ret = bdrv_truncate(bs->file, res->image_end_offset, &local_err);
             if (ret < 0) {
+                error_report_err(local_err);
                 res->check_errors++;
                 return ret;
             }
@@ -475,6 +486,10 @@ static int parallels_create(const char *filename, QemuOpts *opts, Error **errp)
                           BDRV_SECTOR_SIZE);
     cl_size = ROUND_UP(qemu_opt_get_size_del(opts, BLOCK_OPT_CLUSTER_SIZE,
                           DEFAULT_CLUSTER_SIZE), BDRV_SECTOR_SIZE);
+    if (total_size >= MAX_PARALLELS_IMAGE_FACTOR * cl_size) {
+        error_propagate(errp, local_err);
+        return -E2BIG;
+    }
 
     ret = bdrv_create_file(filename, opts, &local_err);
     if (ret < 0) {
@@ -483,7 +498,8 @@ static int parallels_create(const char *filename, QemuOpts *opts, Error **errp)
     }
 
     file = blk_new_open(filename, NULL, NULL,
-                        BDRV_O_RDWR | BDRV_O_PROTOCOL, &local_err);
+                        BDRV_O_RDWR | BDRV_O_RESIZE | BDRV_O_PROTOCOL,
+                        &local_err);
     if (file == NULL) {
         error_propagate(errp, local_err);
         return -EIO;
@@ -491,7 +507,7 @@ static int parallels_create(const char *filename, QemuOpts *opts, Error **errp)
 
     blk_set_allow_write_beyond_eof(file, true);
 
-    ret = blk_truncate(file, 0);
+    ret = blk_truncate(file, 0, errp);
     if (ret < 0) {
         goto exit;
     }
@@ -563,7 +579,7 @@ static int parallels_update_header(BlockDriverState *bs)
     if (size > s->header_size) {
         size = s->header_size;
     }
-    return bdrv_pwrite_sync(bs->file->bs, 0, s->header, size);
+    return bdrv_pwrite_sync(bs->file, 0, s->header, size);
 }
 
 static int parallels_open(BlockDriverState *bs, QDict *options, int flags,
@@ -576,7 +592,13 @@ static int parallels_open(BlockDriverState *bs, QDict *options, int flags,
     Error *local_err = NULL;
     char *buf;
 
-    ret = bdrv_pread(bs->file->bs, 0, &ph, sizeof(ph));
+    bs->file = bdrv_open_child(NULL, options, "file", bs, &child_file,
+                               false, errp);
+    if (!bs->file) {
+        return -EINVAL;
+    }
+
+    ret = bdrv_pread(bs->file, 0, &ph, sizeof(ph));
     if (ret < 0) {
         goto fail;
     }
@@ -631,7 +653,7 @@ static int parallels_open(BlockDriverState *bs, QDict *options, int flags,
         s->header_size = size;
     }
 
-    ret = bdrv_pread(bs->file->bs, 0, s->header, s->header_size);
+    ret = bdrv_pread(bs->file, 0, s->header, s->header_size);
     if (ret < 0) {
         goto fail;
     }
@@ -675,8 +697,9 @@ static int parallels_open(BlockDriverState *bs, QDict *options, int flags,
     if (local_err != NULL) {
         goto fail_options;
     }
-    if (!bdrv_has_zero_init(bs->file->bs) ||
-            bdrv_truncate(bs->file->bs, bdrv_getlength(bs->file->bs)) != 0) {
+
+    if (!(flags & BDRV_O_RESIZE) || !bdrv_has_zero_init(bs->file->bs) ||
+            bdrv_truncate(bs->file, bdrv_getlength(bs->file->bs), NULL) != 0) {
         s->prealloc_mode = PRL_PREALLOC_MODE_FALLOCATE;
     }
 
@@ -719,7 +742,7 @@ static void parallels_close(BlockDriverState *bs)
     }
 
     if (bs->open_flags & BDRV_O_RDWR) {
-        bdrv_truncate(bs->file->bs, s->data_end << BDRV_SECTOR_BITS);
+        bdrv_truncate(bs->file, s->data_end << BDRV_SECTOR_BITS, NULL);
     }
 
     g_free(s->bat_dirty_bmap);
@@ -751,6 +774,7 @@ static BlockDriver bdrv_parallels = {
     .bdrv_probe		= parallels_probe,
     .bdrv_open		= parallels_open,
     .bdrv_close		= parallels_close,
+    .bdrv_child_perm          = bdrv_format_default_perms,
     .bdrv_co_get_block_status = parallels_co_get_block_status,
     .bdrv_has_zero_init       = bdrv_has_zero_init_1,
     .bdrv_co_flush_to_os      = parallels_co_flush_to_os,

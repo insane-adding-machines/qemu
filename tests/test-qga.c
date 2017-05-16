@@ -146,14 +146,30 @@ static void test_qga_sync_delimited(gconstpointer fix)
     QDict *ret;
     gchar *cmd;
 
-    cmd = g_strdup_printf("%c{'execute': 'guest-sync-delimited',"
-                          " 'arguments': {'id': %u } }", 0xff, r);
+    cmd = g_strdup_printf("\xff{'execute': 'guest-sync-delimited',"
+                          " 'arguments': {'id': %u } }", r);
     qmp_fd_send(fixture->fd, cmd);
     g_free(cmd);
 
-    v = read(fixture->fd, &c, 1);
-    g_assert_cmpint(v, ==, 1);
-    g_assert_cmpint(c, ==, 0xff);
+    /*
+     * Read and ignore garbage until resynchronized.
+     *
+     * Note that the full reset sequence would involve checking the
+     * response of guest-sync-delimited and repeating the loop if
+     * 'id' field of the response does not match the 'id' field of
+     * the request. Testing this fully would require inserting
+     * garbage in the response stream and is left as a future test
+     * to implement.
+     *
+     * TODO: The server shouldn't emit so much garbage (among other
+     * things, it loudly complains about the client's \xff being
+     * invalid JSON, even though it is a documented part of the
+     * handshake.
+     */
+    do {
+        v = read(fixture->fd, &c, 1);
+        g_assert_cmpint(v, ==, 1);
+    } while (c != 0xff);
 
     ret = qmp_fd_receive(fixture->fd);
     g_assert_nonnull(ret);
@@ -172,8 +188,19 @@ static void test_qga_sync(gconstpointer fix)
     QDict *ret;
     gchar *cmd;
 
-    cmd = g_strdup_printf("%c{'execute': 'guest-sync',"
-                          " 'arguments': {'id': %u } }", 0xff, r);
+    /*
+     * TODO guest-sync is inherently limited: we cannot distinguish
+     * failure caused by reacting to garbage on the wire prior to this
+     * command, from failure of this actual command. Clients are
+     * supposed to be able to send a raw '\xff' byte to at least
+     * re-synchronize the server's parser prior to this command, but
+     * we are not in a position to test that here because (at least
+     * for now) it causes the server to issue an error message about
+     * invalid JSON. Testing of '\xff' handling is done in
+     * guest-sync-delimited instead.
+     */
+    cmd = g_strdup_printf("{'execute': 'guest-sync',"
+                          " 'arguments': {'id': %u } }", r);
     ret = qmp_fd(fixture->fd, cmd);
     g_free(cmd);
 
@@ -194,6 +221,26 @@ static void test_qga_ping(gconstpointer fix)
     ret = qmp_fd(fixture->fd, "{'execute': 'guest-ping'}");
     g_assert_nonnull(ret);
     qmp_assert_no_error(ret);
+
+    QDECREF(ret);
+}
+
+static void test_qga_invalid_args(gconstpointer fix)
+{
+    const TestFixture *fixture = fix;
+    QDict *ret, *error;
+    const gchar *class, *desc;
+
+    ret = qmp_fd(fixture->fd, "{'execute': 'guest-ping', "
+                 "'arguments': {'foo': 42 }}");
+    g_assert_nonnull(ret);
+
+    error = qdict_get_qdict(ret, "error");
+    class = qdict_get_try_str(error, "class");
+    desc = qdict_get_try_str(error, "desc");
+
+    g_assert_cmpstr(class, ==, "GenericError");
+    g_assert_cmpstr(desc, ==, "Parameter 'foo' is unexpected");
 
     QDECREF(ret);
 }
@@ -398,6 +445,7 @@ static void test_qga_file_ops(gconstpointer fix)
     /* check content */
     path = g_build_filename(fixture->test_dir, "foo", NULL);
     f = fopen(path, "r");
+    g_free(path);
     g_assert_nonnull(f);
     count = fread(tmp, 1, sizeof(tmp), f);
     g_assert_cmpint(count, ==, sizeof(helloworld));
@@ -691,39 +739,27 @@ static void test_qga_blacklist(gconstpointer data)
 static void test_qga_config(gconstpointer data)
 {
     GError *error = NULL;
-    char *cwd, *cmd, *out, *err, *str, **strv, *conf, **argv = NULL;
+    char *cwd, *cmd, *out, *err, *str, **strv, **argv = NULL;
     char *env[2];
-    int status, tmp;
+    int status;
     gsize n;
     GKeyFile *kf;
-    const char *qga_config =
-        "[general]\n"
-        "daemon=false\n"
-        "method=virtio-serial\n"
-        "path=/path/to/org.qemu.guest_agent.0\n"
-        "pidfile=/var/foo/qemu-ga.pid\n"
-        "statedir=/var/state\n"
-        "verbose=true\n"
-        "blacklist=guest-ping;guest-get-time\n";
-
-    tmp = g_file_open_tmp(NULL, &conf, &error);
-    g_assert_no_error(error);
-    g_assert_cmpint(tmp, >=, 0);
-    g_assert_cmpstr(conf, !=, "");
-
-    g_file_set_contents(conf, qga_config, -1, &error);
-    g_assert_no_error(error);
 
     cwd = g_get_current_dir();
     cmd = g_strdup_printf("%s%cqemu-ga -D",
                           cwd, G_DIR_SEPARATOR);
+    g_free(cwd);
     g_shell_parse_argv(cmd, NULL, &argv, &error);
+    g_free(cmd);
     g_assert_no_error(error);
 
-    env[0] = g_strdup_printf("QGA_CONF=%s", conf);
+    env[0] = g_strdup_printf("QGA_CONF=tests%cdata%ctest-qga-config",
+                             G_DIR_SEPARATOR, G_DIR_SEPARATOR);
     env[1] = NULL;
     g_spawn_sync(NULL, argv, env, 0,
                  NULL, NULL, &out, &err, &status, &error);
+    g_strfreev(argv);
+
     g_assert_no_error(error);
     g_assert_cmpstr(err, ==, "");
     g_assert_cmpint(status, ==, 0);
@@ -775,11 +811,8 @@ static void test_qga_config(gconstpointer data)
 
     g_free(out);
     g_free(err);
-    g_free(conf);
     g_free(env[0]);
     g_key_file_free(kf);
-
-    close(tmp);
 }
 
 static void test_qga_fsfreeze_status(gconstpointer fix)
@@ -831,6 +864,7 @@ static void test_qga_guest_exec(gconstpointer fix)
     int64_t pid, now, exitcode;
     gsize len;
     bool exited;
+    char *cmd;
 
     /* exec 'echo foo bar' */
     ret = qmp_fd(fixture->fd, "{'execute': 'guest-exec', 'arguments': {"
@@ -845,9 +879,10 @@ static void test_qga_guest_exec(gconstpointer fix)
 
     /* wait for completion */
     now = g_get_monotonic_time();
+    cmd = g_strdup_printf("{'execute': 'guest-exec-status',"
+                          " 'arguments': { 'pid': %" PRId64 " } }", pid);
     do {
-        ret = qmp_fd(fixture->fd, "{'execute': 'guest-exec-status',"
-                     " 'arguments': { 'pid': %" PRId64 "  } }", pid);
+        ret = qmp_fd(fixture->fd, cmd);
         g_assert_nonnull(ret);
         val = qdict_get_qdict(ret, "return");
         exited = qdict_get_bool(val, "exited");
@@ -857,6 +892,7 @@ static void test_qga_guest_exec(gconstpointer fix)
     } while (!exited &&
              g_get_monotonic_time() < now + 5 * G_TIME_SPAN_SECOND);
     g_assert(exited);
+    g_free(cmd);
 
     /* check stdout */
     exitcode = qdict_get_int(val, "exitcode");
@@ -915,7 +951,9 @@ int main(int argc, char **argv)
     g_test_add_data_func("/qga/info", &fix, test_qga_info);
     g_test_add_data_func("/qga/network-get-interfaces", &fix,
                          test_qga_network_get_interfaces);
-    g_test_add_data_func("/qga/get-vcpus", &fix, test_qga_get_vcpus);
+    if (!access("/sys/devices/system/cpu/cpu0", F_OK)) {
+        g_test_add_data_func("/qga/get-vcpus", &fix, test_qga_get_vcpus);
+    }
     g_test_add_data_func("/qga/get-fsinfo", &fix, test_qga_get_fsinfo);
     g_test_add_data_func("/qga/get-memory-block-info", &fix,
                          test_qga_get_memory_block_info);
@@ -925,6 +963,7 @@ int main(int argc, char **argv)
     g_test_add_data_func("/qga/file-write-read", &fix, test_qga_file_write_read);
     g_test_add_data_func("/qga/get-time", &fix, test_qga_get_time);
     g_test_add_data_func("/qga/invalid-cmd", &fix, test_qga_invalid_cmd);
+    g_test_add_data_func("/qga/invalid-args", &fix, test_qga_invalid_args);
     g_test_add_data_func("/qga/fsfreeze-status", &fix,
                          test_qga_fsfreeze_status);
 

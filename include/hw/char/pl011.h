@@ -12,12 +12,12 @@
  * this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef PL011_UART_H
-#define PL011_UART_H
+#ifndef HW_PL011_H
+#define HW_PL011_H
 
 static inline DeviceState *pl011_create(hwaddr addr,
                                         qemu_irq irq,
-                                        CharDriverState *chr)
+                                        Chardev *chr)
 {
     DeviceState *dev;
     SysBusDevice *s;
@@ -34,7 +34,7 @@ static inline DeviceState *pl011_create(hwaddr addr,
 
 static inline DeviceState *pl011_luminary_create(hwaddr addr,
                                                  qemu_irq irq,
-                                                 CharDriverState *chr)
+                                                 Chardev *chr)
 {
     DeviceState *dev;
     SysBusDevice *s;

@@ -16,7 +16,8 @@
 #include "cpu.h"
 
 struct IplBlockCcw {
-    uint8_t  reserved0[85];
+    uint64_t netboot_start_addr;
+    uint8_t  reserved0[77];
     uint8_t  ssid;
     uint16_t devno;
     uint8_t  vm_flags;
@@ -46,6 +47,18 @@ struct IplBlockFcp {
 } QEMU_PACKED;
 typedef struct IplBlockFcp IplBlockFcp;
 
+struct IplBlockQemuScsi {
+    uint32_t lun;
+    uint16_t target;
+    uint16_t channel;
+    uint8_t  reserved0[77];
+    uint8_t  ssid;
+    uint16_t devno;
+} QEMU_PACKED;
+typedef struct IplBlockQemuScsi IplBlockQemuScsi;
+
+#define DIAG308_FLAGS_LP_VALID 0x80
+
 union IplParameterBlock {
     struct {
         uint32_t len;
@@ -59,6 +72,7 @@ union IplParameterBlock {
         union {
             IplBlockCcw ccw;
             IplBlockFcp fcp;
+            IplBlockQemuScsi scsi;
         };
     } QEMU_PACKED;
     struct {
@@ -70,6 +84,7 @@ union IplParameterBlock {
 } QEMU_PACKED;
 typedef union IplParameterBlock IplParameterBlock;
 
+int s390_ipl_set_loadparm(uint8_t *loadparm);
 void s390_ipl_update_diag308(IplParameterBlock *iplb);
 void s390_ipl_prepare_cpu(S390CPU *cpu);
 IplParameterBlock *s390_ipl_get_iplb(void);
@@ -82,17 +97,21 @@ struct S390IPLState {
     /*< private >*/
     DeviceState parent_obj;
     uint64_t start_addr;
+    uint64_t compat_start_addr;
     uint64_t bios_start_addr;
+    uint64_t compat_bios_start_addr;
     bool enforce_bios;
     IplParameterBlock iplb;
     bool iplb_valid;
     bool reipl_requested;
+    bool netboot;
 
     /*< public >*/
     char *kernel;
     char *initrd;
     char *cmdline;
     char *firmware;
+    char *netboot_fw;
     uint8_t cssid;
     uint8_t ssid;
     uint16_t devno;
@@ -102,10 +121,12 @@ typedef struct S390IPLState S390IPLState;
 
 #define S390_IPL_TYPE_FCP 0x00
 #define S390_IPL_TYPE_CCW 0x02
+#define S390_IPL_TYPE_QEMU_SCSI 0xff
 
 #define S390_IPLB_HEADER_LEN 8
 #define S390_IPLB_MIN_CCW_LEN 200
 #define S390_IPLB_MIN_FCP_LEN 384
+#define S390_IPLB_MIN_QEMU_SCSI_LEN 200
 
 static inline bool iplb_valid_len(IplParameterBlock *iplb)
 {

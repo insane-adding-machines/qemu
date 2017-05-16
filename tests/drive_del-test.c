@@ -92,7 +92,7 @@ static void test_after_failed_device_add(void)
 static void test_drive_del_device_del(void)
 {
     /* Start with a drive used by a device that unplugs instantaneously */
-    qtest_start("-drive if=none,id=drive0,file=/dev/null,format=raw"
+    qtest_start("-drive if=none,id=drive0,file=null-co://,format=raw"
                 " -device virtio-scsi-pci"
                 " -device scsi-hd,drive=drive0,id=dev0");
 
@@ -115,7 +115,8 @@ int main(int argc, char **argv)
     qtest_add_func("/drive_del/without-dev", test_drive_without_dev);
 
     /* TODO I guess any arch with PCI would do */
-    if (!strcmp(arch, "i386") || !strcmp(arch, "x86_64")) {
+    if (!strcmp(arch, "i386") || !strcmp(arch, "x86_64") ||
+        !strcmp(arch, "ppc") || !strcmp(arch, "ppc64")) {
         qtest_add_func("/drive_del/after_failed_device_add",
                        test_after_failed_device_add);
         qtest_add_func("/blockdev/drive_del_device_del",

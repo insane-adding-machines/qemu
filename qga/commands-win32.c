@@ -11,6 +11,9 @@
  * See the COPYING file in the top-level directory.
  */
 
+#ifndef _WIN32_WINNT
+#   define _WIN32_WINNT 0x0600
+#endif
 #include "qemu/osdep.h"
 #include <wtypes.h>
 #include <powrprof.h>
@@ -25,6 +28,7 @@
 #include <initguid.h>
 #endif
 #include <lm.h>
+#include <wtsapi32.h>
 
 #include "qga/guest-agent-core.h"
 #include "qga/vss-win32.h"
@@ -768,7 +772,7 @@ int64_t qmp_guest_fsfreeze_freeze(Error **errp)
     /* cannot risk guest agent blocking itself on a write in this state */
     ga_set_frozen(ga_state);
 
-    qga_vss_fsfreeze(&i, &local_err, true);
+    qga_vss_fsfreeze(&i, true, &local_err);
     if (local_err) {
         error_propagate(errp, local_err);
         goto error;
@@ -807,7 +811,7 @@ int64_t qmp_guest_fsfreeze_thaw(Error **errp)
         return 0;
     }
 
-    qga_vss_fsfreeze(&i, errp, false);
+    qga_vss_fsfreeze(&i, false, errp);
 
     ga_unset_frozen(ga_state);
     return i;
@@ -840,8 +844,99 @@ static void guest_fsfreeze_cleanup(void)
 GuestFilesystemTrimResponse *
 qmp_guest_fstrim(bool has_minimum, int64_t minimum, Error **errp)
 {
-    error_setg(errp, QERR_UNSUPPORTED);
-    return NULL;
+    GuestFilesystemTrimResponse *resp;
+    HANDLE handle;
+    WCHAR guid[MAX_PATH] = L"";
+
+    handle = FindFirstVolumeW(guid, ARRAYSIZE(guid));
+    if (handle == INVALID_HANDLE_VALUE) {
+        error_setg_win32(errp, GetLastError(), "failed to find any volume");
+        return NULL;
+    }
+
+    resp = g_new0(GuestFilesystemTrimResponse, 1);
+
+    do {
+        GuestFilesystemTrimResult *res;
+        GuestFilesystemTrimResultList *list;
+        PWCHAR uc_path;
+        DWORD char_count = 0;
+        char *path, *out;
+        GError *gerr = NULL;
+        gchar * argv[4];
+
+        GetVolumePathNamesForVolumeNameW(guid, NULL, 0, &char_count);
+
+        if (GetLastError() != ERROR_MORE_DATA) {
+            continue;
+        }
+        if (GetDriveTypeW(guid) != DRIVE_FIXED) {
+            continue;
+        }
+
+        uc_path = g_malloc(sizeof(WCHAR) * char_count);
+        if (!GetVolumePathNamesForVolumeNameW(guid, uc_path, char_count,
+                                              &char_count) || !*uc_path) {
+            /* strange, but this condition could be faced even with size == 2 */
+            g_free(uc_path);
+            continue;
+        }
+
+        res = g_new0(GuestFilesystemTrimResult, 1);
+
+        path = g_utf16_to_utf8(uc_path, char_count, NULL, NULL, &gerr);
+
+        g_free(uc_path);
+
+        if (!path) {
+            res->has_error = true;
+            res->error = g_strdup(gerr->message);
+            g_error_free(gerr);
+            break;
+        }
+
+        res->path = path;
+
+        list = g_new0(GuestFilesystemTrimResultList, 1);
+        list->value = res;
+        list->next = resp->paths;
+
+        resp->paths = list;
+
+        memset(argv, 0, sizeof(argv));
+        argv[0] = (gchar *)"defrag.exe";
+        argv[1] = (gchar *)"/L";
+        argv[2] = path;
+
+        if (!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL,
+                          &out /* stdout */, NULL /* stdin */,
+                          NULL, &gerr)) {
+            res->has_error = true;
+            res->error = g_strdup(gerr->message);
+            g_error_free(gerr);
+        } else {
+            /* defrag.exe is UGLY. Exit code is ALWAYS zero.
+               Error is reported in the output with something like
+               (x89000020) etc code in the stdout */
+
+            int i;
+            gchar **lines = g_strsplit(out, "\r\n", 0);
+            g_free(out);
+
+            for (i = 0; lines[i] != NULL; i++) {
+                if (g_strstr_len(lines[i], -1, "(0x") == NULL) {
+                    continue;
+                }
+                res->has_error = true;
+                res->error = g_strdup(lines[i]);
+                break;
+            }
+            g_strfreev(lines);
+        }
+    } while (FindNextVolumeW(handle, guid, ARRAYSIZE(guid)));
+
+    FindVolumeClose(handle);
+    return resp;
 }
 
 typedef enum {
@@ -1253,7 +1348,7 @@ GuestLogicalProcessorList *qmp_guest_get_vcpus(Error **errp)
                     vcpu = g_malloc0(sizeof *vcpu);
                     vcpu->logical_id = current++;
                     vcpu->online = true;
-                    vcpu->has_can_offline = false;
+                    vcpu->has_can_offline = true;
 
                     entry = g_malloc0(sizeof *entry);
                     entry->value = vcpu;
@@ -1416,7 +1511,7 @@ GList *ga_command_blacklist_init(GList *blacklist)
         "guest-get-memory-blocks", "guest-set-memory-blocks",
         "guest-get-memory-block-size",
         "guest-fsfreeze-freeze-list",
-        "guest-fstrim", NULL};
+        NULL};
     char **p = (char **)list_unsupported;
 
     while (*p) {
@@ -1444,4 +1539,103 @@ void ga_command_state_init(GAState *s, GACommandState *cs)
     if (!vss_initialized()) {
         ga_command_state_add(cs, NULL, guest_fsfreeze_cleanup);
     }
+}
+
+/* MINGW is missing two fields: IncomingFrames & OutgoingFrames */
+typedef struct _GA_WTSINFOA {
+    WTS_CONNECTSTATE_CLASS State;
+    DWORD SessionId;
+    DWORD IncomingBytes;
+    DWORD OutgoingBytes;
+    DWORD IncomingFrames;
+    DWORD OutgoingFrames;
+    DWORD IncomingCompressedBytes;
+    DWORD OutgoingCompressedBy;
+    CHAR WinStationName[WINSTATIONNAME_LENGTH];
+    CHAR Domain[DOMAIN_LENGTH];
+    CHAR UserName[USERNAME_LENGTH + 1];
+    LARGE_INTEGER ConnectTime;
+    LARGE_INTEGER DisconnectTime;
+    LARGE_INTEGER LastInputTime;
+    LARGE_INTEGER LogonTime;
+    LARGE_INTEGER CurrentTime;
+
+} GA_WTSINFOA;
+
+GuestUserList *qmp_guest_get_users(Error **err)
+{
+#if (_WIN32_WINNT >= 0x0600)
+#define QGA_NANOSECONDS 10000000
+
+    GHashTable *cache = NULL;
+    GuestUserList *head = NULL, *cur_item = NULL;
+
+    DWORD buffer_size = 0, count = 0, i = 0;
+    GA_WTSINFOA *info = NULL;
+    WTS_SESSION_INFOA *entries = NULL;
+    GuestUserList *item = NULL;
+    GuestUser *user = NULL;
+    gpointer value = NULL;
+    INT64 login = 0;
+    double login_time = 0;
+
+    cache = g_hash_table_new(g_str_hash, g_str_equal);
+
+    if (WTSEnumerateSessionsA(NULL, 0, 1, &entries, &count)) {
+        for (i = 0; i < count; ++i) {
+            buffer_size = 0;
+            info = NULL;
+            if (WTSQuerySessionInformationA(
+                NULL,
+                entries[i].SessionId,
+                WTSSessionInfo,
+                (LPSTR *)&info,
+                &buffer_size
+            )) {
+
+                if (strlen(info->UserName) == 0) {
+                    WTSFreeMemory(info);
+                    continue;
+                }
+
+                login = info->LogonTime.QuadPart;
+                login -= W32_FT_OFFSET;
+                login_time = ((double)login) / QGA_NANOSECONDS;
+
+                if (g_hash_table_contains(cache, info->UserName)) {
+                    value = g_hash_table_lookup(cache, info->UserName);
+                    user = (GuestUser *)value;
+                    if (user->login_time > login_time) {
+                        user->login_time = login_time;
+                    }
+                } else {
+                    item = g_new0(GuestUserList, 1);
+                    item->value = g_new0(GuestUser, 1);
+
+                    item->value->user = g_strdup(info->UserName);
+                    item->value->domain = g_strdup(info->Domain);
+                    item->value->has_domain = true;
+
+                    item->value->login_time = login_time;
+
+                    g_hash_table_add(cache, item->value->user);
+
+                    if (!cur_item) {
+                        head = cur_item = item;
+                    } else {
+                        cur_item->next = item;
+                        cur_item = item;
+                    }
+                }
+            }
+            WTSFreeMemory(info);
+        }
+        WTSFreeMemory(entries);
+    }
+    g_hash_table_destroy(cache);
+    return head;
+#else
+    error_setg(err, QERR_UNSUPPORTED);
+    return NULL;
+#endif
 }

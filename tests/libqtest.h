@@ -32,6 +32,14 @@ extern QTestState *global_qtest;
 QTestState *qtest_init(const char *extra_args);
 
 /**
+ * qtest_init_without_qmp_handshake:
+ * @extra_args: other arguments to pass to QEMU.
+ *
+ * Returns: #QTestState instance.
+ */
+QTestState *qtest_init_without_qmp_handshake(const char *extra_args);
+
+/**
  * qtest_quit:
  * @s: #QTestState instance to operate on.
  *
@@ -114,11 +122,22 @@ QDict *qtest_qmp_receive(QTestState *s);
 void qtest_qmp_eventwait(QTestState *s, const char *event);
 
 /**
- * qtest_hmpv:
+ * qtest_qmp_eventwait_ref:
+ * @s: #QTestState instance to operate on.
+ * @s: #event event to wait for.
+ *
+ * Continuosly polls for QMP responses until it receives the desired event.
+ * Returns a copy of the event for further investigation.
+ */
+QDict *qtest_qmp_eventwait_ref(QTestState *s, const char *event);
+
+/**
+ * qtest_hmp:
  * @s: #QTestState instance to operate on.
  * @fmt...: HMP command to send to QEMU
  *
  * Send HMP command to QEMU via QMP's human-monitor-command.
+ * QMP events are discarded.
  *
  * Returns: the command's output.  The caller should g_free() it.
  */
@@ -131,6 +150,7 @@ char *qtest_hmp(QTestState *s, const char *fmt, ...);
  * @ap: HMP command arguments
  *
  * Send HMP command to QEMU via QMP's human-monitor-command.
+ * QMP events are discarded.
  *
  * Returns: the command's output.  The caller should g_free() it.
  */
@@ -318,6 +338,21 @@ uint64_t qtest_readq(QTestState *s, uint64_t addr);
 void qtest_memread(QTestState *s, uint64_t addr, void *data, size_t size);
 
 /**
+ * qtest_rtas_call:
+ * @s: #QTestState instance to operate on.
+ * @name: name of the command to call.
+ * @nargs: Number of args.
+ * @args: Guest address to read args from.
+ * @nret: Number of return value.
+ * @ret: Guest address to write return values to.
+ *
+ * Call an RTAS function
+ */
+uint64_t qtest_rtas_call(QTestState *s, const char *name,
+                         uint32_t nargs, uint64_t args,
+                         uint32_t nret, uint64_t ret);
+
+/**
  * qtest_bufread:
  * @s: #QTestState instance to operate on.
  * @addr: Guest address to read from.
@@ -395,6 +430,14 @@ int64_t qtest_clock_step(QTestState *s, int64_t step);
 int64_t qtest_clock_set(QTestState *s, int64_t val);
 
 /**
+ * qtest_big_endian:
+ * @s: QTestState instance to operate on.
+ *
+ * Returns: True if the architecture under test has a big endian configuration.
+ */
+bool qtest_big_endian(QTestState *s);
+
+/**
  * qtest_get_arch:
  *
  * Returns: The architecture for the QEMU executable under test.
@@ -424,6 +467,23 @@ void qtest_add_func(const char *str, void (*fn)(void));
  */
 void qtest_add_data_func(const char *str, const void *data,
                          void (*fn)(const void *));
+
+/**
+ * qtest_add_data_func_full:
+ * @str: Test case path.
+ * @data: Test case data
+ * @fn: Test case function
+ * @data_free_func: GDestroyNotify for data
+ *
+ * Add a GTester testcase with the given name, data and function.
+ * The path is prefixed with the architecture under test, as
+ * returned by qtest_get_arch().
+ *
+ * @data is passed to @data_free_func() on test completion.
+ */
+void qtest_add_data_func_full(const char *str, void *data,
+                              void (*fn)(const void *),
+                              GDestroyNotify data_free_func);
 
 /**
  * qtest_add:
@@ -516,6 +576,18 @@ static inline QDict *qmp_receive(void)
 static inline void qmp_eventwait(const char *event)
 {
     return qtest_qmp_eventwait(global_qtest, event);
+}
+
+/**
+ * qmp_eventwait_ref:
+ * @s: #event event to wait for.
+ *
+ * Continuosly polls for QMP responses until it receives the desired event.
+ * Returns a copy of the event for further investigation.
+ */
+static inline QDict *qmp_eventwait_ref(const char *event)
+{
+    return qtest_qmp_eventwait_ref(global_qtest, event);
 }
 
 /**
@@ -841,18 +913,18 @@ static inline int64_t clock_set(int64_t val)
     return qtest_clock_set(global_qtest, val);
 }
 
-/**
- * qtest_big_endian:
- *
- * Returns: True if the architecture under test has a big endian configuration.
- */
-bool qtest_big_endian(void);
-
-
 QDict *qmp_fd_receive(int fd);
 void qmp_fd_sendv(int fd, const char *fmt, va_list ap);
 void qmp_fd_send(int fd, const char *fmt, ...);
 QDict *qmp_fdv(int fd, const char *fmt, va_list ap);
 QDict *qmp_fd(int fd, const char *fmt, ...);
+
+/**
+ * qtest_cb_for_every_machine:
+ * @cb: Pointer to the callback function
+ *
+ *  Call a callback function for every name of all available machines.
+ */
+void qtest_cb_for_every_machine(void (*cb)(const char *machine));
 
 #endif
