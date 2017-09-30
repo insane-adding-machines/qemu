@@ -38,6 +38,7 @@
 #include "sysemu/sysemu.h"
 #include "exec/cpu_ldst.h"
 #include "exec/semihost.h"
+#include "exec/translator.h"
 
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
@@ -45,6 +46,9 @@
 #include "trace-tcg.h"
 #include "exec/log.h"
 
+
+/* is_jmp field values */
+#define DISAS_UPDATE  DISAS_TARGET_0 /* cpu state was modified dynamically */
 
 typedef struct DisasContext {
     const XtensaConfig *config;
@@ -3117,10 +3121,9 @@ static void gen_ibreak_check(CPUXtensaState *env, DisasContext *dc)
     }
 }
 
-void gen_intermediate_code(CPUXtensaState *env, TranslationBlock *tb)
+void gen_intermediate_code(CPUState *cs, TranslationBlock *tb)
 {
-    XtensaCPU *cpu = xtensa_env_get_cpu(env);
-    CPUState *cs = CPU(cpu);
+    CPUXtensaState *env = cs->env_ptr;
     DisasContext dc;
     int insn_count = 0;
     int max_insns = tb->cflags & CF_COUNT_MASK;

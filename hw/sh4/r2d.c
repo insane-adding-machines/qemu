@@ -164,7 +164,7 @@ r2d_fpga_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
 	break;
     case PA_POWOFF:
         if (value & 1) {
-            qemu_system_shutdown_request();
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         }
         break;
     case PA_VERREG:
@@ -246,11 +246,7 @@ static void r2d_init(MachineState *machine)
         cpu_model = "SH7751R";
     }
 
-    cpu = cpu_sh4_init(cpu_model);
-    if (cpu == NULL) {
-        fprintf(stderr, "Unable to find CPU definition\n");
-        exit(1);
-    }
+    cpu = SUPERH_CPU(cpu_generic_init(TYPE_SUPERH_CPU, cpu_model));
     env = &cpu->env;
 
     reset_info = g_malloc0(sizeof(ResetData));
@@ -260,7 +256,6 @@ static void r2d_init(MachineState *machine)
 
     /* Allocate memory space */
     memory_region_init_ram(sdram, NULL, "r2d.sdram", SDRAM_SIZE, &error_fatal);
-    vmstate_register_ram_global(sdram);
     memory_region_add_subregion(address_space_mem, SDRAM_BASE, sdram);
     /* Register peripherals */
     s = sh7750_init(cpu, address_space_mem);

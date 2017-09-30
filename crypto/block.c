@@ -48,6 +48,7 @@ bool qcrypto_block_has_format(QCryptoBlockFormat format,
 
 
 QCryptoBlock *qcrypto_block_open(QCryptoBlockOpenOptions *options,
+                                 const char *optprefix,
                                  QCryptoBlockReadFunc readfunc,
                                  void *opaque,
                                  unsigned int flags,
@@ -60,14 +61,14 @@ QCryptoBlock *qcrypto_block_open(QCryptoBlockOpenOptions *options,
     if (options->format >= G_N_ELEMENTS(qcrypto_block_drivers) ||
         !qcrypto_block_drivers[options->format]) {
         error_setg(errp, "Unsupported block driver %s",
-                   QCryptoBlockFormat_lookup[options->format]);
+                   QCryptoBlockFormat_str(options->format));
         g_free(block);
         return NULL;
     }
 
     block->driver = qcrypto_block_drivers[options->format];
 
-    if (block->driver->open(block, options,
+    if (block->driver->open(block, options, optprefix,
                             readfunc, opaque, flags, errp) < 0) {
         g_free(block);
         return NULL;
@@ -78,6 +79,7 @@ QCryptoBlock *qcrypto_block_open(QCryptoBlockOpenOptions *options,
 
 
 QCryptoBlock *qcrypto_block_create(QCryptoBlockCreateOptions *options,
+                                   const char *optprefix,
                                    QCryptoBlockInitFunc initfunc,
                                    QCryptoBlockWriteFunc writefunc,
                                    void *opaque,
@@ -90,14 +92,14 @@ QCryptoBlock *qcrypto_block_create(QCryptoBlockCreateOptions *options,
     if (options->format >= G_N_ELEMENTS(qcrypto_block_drivers) ||
         !qcrypto_block_drivers[options->format]) {
         error_setg(errp, "Unsupported block driver %s",
-                   QCryptoBlockFormat_lookup[options->format]);
+                   QCryptoBlockFormat_str(options->format));
         g_free(block);
         return NULL;
     }
 
     block->driver = qcrypto_block_drivers[options->format];
 
-    if (block->driver->create(block, options, initfunc,
+    if (block->driver->create(block, options, optprefix, initfunc,
                               writefunc, opaque, errp) < 0) {
         g_free(block);
         return NULL;

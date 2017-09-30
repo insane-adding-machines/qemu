@@ -27,6 +27,7 @@
 #include "qemu/log.h"
 #include "qemu/bitops.h"
 #include "exec/cpu_ldst.h"
+#include "exec/translator.h"
 
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
@@ -36,6 +37,11 @@
 
 #define LOG_DIS(str, ...) \
     qemu_log_mask(CPU_LOG_TB_IN_ASM, "%08x: " str, dc->pc, ## __VA_ARGS__)
+
+/* is_jmp field values */
+#define DISAS_JUMP    DISAS_TARGET_0 /* only pc was modified dynamically */
+#define DISAS_UPDATE  DISAS_TARGET_1 /* cpu state was modified dynamically */
+#define DISAS_TB_JUMP DISAS_TARGET_2 /* only pc was modified statically */
 
 typedef struct DisasContext {
     TranslationBlock *tb;
@@ -1518,10 +1524,10 @@ static void disas_openrisc_insn(DisasContext *dc, OpenRISCCPU *cpu)
     }
 }
 
-void gen_intermediate_code(CPUOpenRISCState *env, struct TranslationBlock *tb)
+void gen_intermediate_code(CPUState *cs, struct TranslationBlock *tb)
 {
+    CPUOpenRISCState *env = cs->env_ptr;
     OpenRISCCPU *cpu = openrisc_env_get_cpu(env);
-    CPUState *cs = CPU(cpu);
     struct DisasContext ctx, *dc = &ctx;
     uint32_t pc_start;
     uint32_t next_page_start;

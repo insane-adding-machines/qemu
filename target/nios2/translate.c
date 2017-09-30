@@ -29,6 +29,12 @@
 #include "exec/helper-gen.h"
 #include "exec/log.h"
 #include "exec/cpu_ldst.h"
+#include "exec/translator.h"
+
+/* is_jmp field values */
+#define DISAS_JUMP    DISAS_TARGET_0 /* only pc was modified dynamically */
+#define DISAS_UPDATE  DISAS_TARGET_1 /* cpu state was modified dynamically */
+#define DISAS_TB_JUMP DISAS_TARGET_2 /* only pc was modified statically */
 
 #define INSTRUCTION_FLG(func, flags) { (func), (flags) }
 #define INSTRUCTION(func)                  \
@@ -164,7 +170,7 @@ static void gen_goto_tb(DisasContext *dc, int n, uint32_t dest)
     if (use_goto_tb(dc, dest)) {
         tcg_gen_goto_tb(n);
         tcg_gen_movi_tl(dc->cpu_R[R_PC], dest);
-        tcg_gen_exit_tb((tcg_target_long)tb + n);
+        tcg_gen_exit_tb((uintptr_t)tb + n);
     } else {
         tcg_gen_movi_tl(dc->cpu_R[R_PC], dest);
         tcg_gen_exit_tb(0);
@@ -799,10 +805,9 @@ static void gen_exception(DisasContext *dc, uint32_t excp)
 }
 
 /* generate intermediate code for basic block 'tb'.  */
-void gen_intermediate_code(CPUNios2State *env, TranslationBlock *tb)
+void gen_intermediate_code(CPUState *cs, TranslationBlock *tb)
 {
-    Nios2CPU *cpu = nios2_env_get_cpu(env);
-    CPUState *cs = CPU(cpu);
+    CPUNios2State *env = cs->env_ptr;
     DisasContext dc1, *dc = &dc1;
     int num_insns;
     int max_insns;

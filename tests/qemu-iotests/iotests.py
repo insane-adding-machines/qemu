@@ -27,6 +27,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'scripts'))
 import qtest
 import struct
 import json
+import signal
 
 
 # This will not work if arguments contain spaces but is necessary if we
@@ -132,10 +133,58 @@ chown_re = re.compile(r"chown [0-9]+:[0-9]+")
 def filter_chown(msg):
     return chown_re.sub("chown UID:GID", msg)
 
+def filter_qmp_event(event):
+    '''Filter a QMP event dict'''
+    event = dict(event)
+    if 'timestamp' in event:
+        event['timestamp']['seconds'] = 'SECS'
+        event['timestamp']['microseconds'] = 'USECS'
+    return event
+
 def log(msg, filters=[]):
     for flt in filters:
         msg = flt(msg)
     print msg
+
+class Timeout:
+    def __init__(self, seconds, errmsg = "Timeout"):
+        self.seconds = seconds
+        self.errmsg = errmsg
+    def __enter__(self):
+        signal.signal(signal.SIGALRM, self.timeout)
+        signal.setitimer(signal.ITIMER_REAL, self.seconds)
+        return self
+    def __exit__(self, type, value, traceback):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        return False
+    def timeout(self, signum, frame):
+        raise Exception(self.errmsg)
+
+
+class FilePath(object):
+    '''An auto-generated filename that cleans itself up.
+
+    Use this context manager to generate filenames and ensure that the file
+    gets deleted::
+
+        with TestFilePath('test.img') as img_path:
+            qemu_img('create', img_path, '1G')
+        # migration_sock_path is automatically deleted
+    '''
+    def __init__(self, name):
+        filename = '{0}-{1}'.format(os.getpid(), name)
+        self.path = os.path.join(test_dir, filename)
+
+    def __enter__(self):
+        return self.path
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+        return False
+
 
 class VM(qtest.QEMUQtestMachine):
     '''A QEMU VM'''
@@ -183,6 +232,11 @@ class VM(qtest.QEMUQtestMachine):
             self._args.append(opts)
         else:
             self._args.append(','.join(opts))
+        return self
+
+    def add_incoming(self, addr):
+        self._args.append('-incoming')
+        self._args.append(addr)
         return self
 
     def pause_drive(self, drive, event=None):
@@ -346,6 +400,18 @@ class QMPTestCase(unittest.TestCase):
         event = self.wait_until_completed(drive=drive)
         self.assert_qmp(event, 'data/type', 'mirror')
 
+    def pause_job(self, job_id='job0'):
+        result = self.vm.qmp('block-job-pause', device=job_id)
+        self.assert_qmp(result, 'return', {})
+
+        with Timeout(1, "Timeout waiting for job to pause"):
+            while True:
+                result = self.vm.qmp('query-block-jobs')
+                for job in result['return']:
+                    if job['device'] == job_id and job['paused'] == True and job['busy'] == False:
+                        return job
+
+
 def notrun(reason):
     '''Skip this test suite'''
     # Each test in qemu-iotests has a number ("seq")
@@ -355,8 +421,10 @@ def notrun(reason):
     print '%s not run: %s' % (seq, reason)
     sys.exit(0)
 
-def verify_image_format(supported_fmts=[]):
+def verify_image_format(supported_fmts=[], unsupported_fmts=[]):
     if supported_fmts and (imgfmt not in supported_fmts):
+        notrun('not suitable for this image format: %s' % imgfmt)
+    if unsupported_fmts and (imgfmt in unsupported_fmts):
         notrun('not suitable for this image format: %s' % imgfmt)
 
 def verify_platform(supported_oses=['linux']):

@@ -118,22 +118,16 @@ static void moxiesim_init(MachineState *machine)
     if (cpu_model == NULL) {
         cpu_model = "MoxieLite-moxie-cpu";
     }
-    cpu = cpu_moxie_init(cpu_model);
-    if (!cpu) {
-        fprintf(stderr, "Unable to find CPU definition\n");
-        exit(1);
-    }
+    cpu = MOXIE_CPU(cpu_generic_init(TYPE_MOXIE_CPU, cpu_model));
     env = &cpu->env;
 
     qemu_register_reset(main_cpu_reset, cpu);
 
     /* Allocate RAM. */
     memory_region_init_ram(ram, NULL, "moxiesim.ram", ram_size, &error_fatal);
-    vmstate_register_ram_global(ram);
     memory_region_add_subregion(address_space_mem, ram_base, ram);
 
-    memory_region_init_ram(rom, NULL, "moxie.rom", 128*0x1000, &error_fatal);
-    vmstate_register_ram_global(rom);
+    memory_region_init_ram(rom, NULL, "moxie.rom", 128 * 0x1000, &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0x1000, rom);
 
     if (kernel_filename) {

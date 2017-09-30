@@ -1314,12 +1314,12 @@ static int ccid_card_init(DeviceState *qdev)
     int ret = 0;
 
     if (card->slot != 0) {
-        error_report("Warning: usb-ccid supports one slot, can't add %d",
-                card->slot);
+        warn_report("usb-ccid supports one slot, can't add %d",
+                    card->slot);
         return -1;
     }
     if (s->card != NULL) {
-        error_report("Warning: usb-ccid card already full, not adding");
+        warn_report("usb-ccid card already full, not adding");
         return -1;
     }
     ret = ccid_card_initfn(card);
@@ -1374,7 +1374,7 @@ static int ccid_post_load(void *opaque, int version_id)
     return 0;
 }
 
-static void ccid_pre_save(void *opaque)
+static int ccid_pre_save(void *opaque)
 {
     USBCCIDState *s = opaque;
 
@@ -1386,6 +1386,8 @@ static void ccid_pre_save(void *opaque)
          */
         s->migration_state = MIGRATION_MIGRATED;
     }
+
+    return 0;
 }
 
 static VMStateDescription bulk_in_vmstate = {

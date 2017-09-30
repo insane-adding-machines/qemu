@@ -18,11 +18,12 @@ use Getopt::Long qw(:config no_auto_abbrev);
 my $quiet = 0;
 my $tree = 1;
 my $chk_signoff = 1;
-my $chk_patch = 1;
+my $chk_patch = undef;
+my $chk_branch = undef;
 my $tst_only;
 my $emacs = 0;
 my $terse = 0;
-my $file = 0;
+my $file = undef;
 my $no_warnings = 0;
 my $summary = 1;
 my $mailback = 0;
@@ -35,14 +36,19 @@ sub help {
 	my ($exitcode) = @_;
 
 	print << "EOM";
-Usage: $P [OPTION]... [FILE]...
+Usage:
+
+    $P [OPTION]... [FILE]...
+    $P [OPTION]... [GIT-REV-LIST]
+
 Version: $V
 
 Options:
   -q, --quiet                quiet
   --no-tree                  run without a kernel tree
   --no-signoff               do not check for 'Signed-off-by' line
-  --patch                    treat FILE as patchfile (default)
+  --patch                    treat FILE as patchfile
+  --branch                   treat args as GIT revision list
   --emacs                    emacs compile window format
   --terse                    one line per report
   -f, --file                 treat FILE as regular source file
@@ -69,6 +75,7 @@ GetOptions(
 	'tree!'		=> \$tree,
 	'signoff!'	=> \$chk_signoff,
 	'patch!'	=> \$chk_patch,
+	'branch!'	=> \$chk_branch,
 	'emacs!'	=> \$emacs,
 	'terse!'	=> \$terse,
 	'f|file!'	=> \$file,
@@ -91,6 +98,49 @@ my $exit = 0;
 if ($#ARGV < 0) {
 	print "$P: no input files\n";
 	exit(1);
+}
+
+if (!defined $chk_branch && !defined $chk_patch && !defined $file) {
+	$chk_branch = $ARGV[0] =~ /\.\./ ? 1 : 0;
+	$chk_patch = $chk_branch ? 0 :
+		$ARGV[0] =~ /\.patch$/ || $ARGV[0] eq "-" ? 1 : 0;
+	$file = $chk_branch || $chk_patch ? 0 : 1;
+} elsif (!defined $chk_branch && !defined $chk_patch) {
+	if ($file) {
+		$chk_branch = $chk_patch = 0;
+	} else {
+		$chk_branch = $ARGV[0] =~ /\.\./ ? 1 : 0;
+		$chk_patch = $chk_branch ? 0 : 1;
+	}
+} elsif (!defined $chk_branch && !defined $file) {
+	if ($chk_patch) {
+		$chk_branch = $file = 0;
+	} else {
+		$chk_branch = $ARGV[0] =~ /\.\./ ? 1 : 0;
+		$file = $chk_branch ? 0 : 1;
+	}
+} elsif (!defined $chk_patch && !defined $file) {
+	if ($chk_branch) {
+		$chk_patch = $file = 0;
+	} else {
+		$chk_patch = $ARGV[0] =~ /\.patch$/ || $ARGV[0] eq "-" ? 1 : 0;
+		$file = $chk_patch ? 0 : 1;
+	}
+} elsif (!defined $chk_branch) {
+	$chk_branch = $chk_patch || $file ? 0 : 1;
+} elsif (!defined $chk_patch) {
+	$chk_patch = $chk_branch || $file ? 0 : 1;
+} elsif (!defined $file) {
+	$file = $chk_patch || $chk_branch ? 0 : 1;
+}
+
+if (($chk_patch && $chk_branch) ||
+    ($chk_patch && $file) ||
+    ($chk_branch && $file)) {
+	die "Only one of --file, --branch, --patch is permitted\n";
+}
+if (!$chk_patch && !$chk_branch && !$file) {
+	die "One of --file, --branch, --patch is required\n";
 }
 
 my $dbg_values = 0;
@@ -213,6 +263,7 @@ our @typeList = (
 	qr{${Ident}_handler},
 	qr{${Ident}_handler_fn},
 	qr{target_(?:u)?long},
+	qr{hwaddr},
 );
 
 # This can be modified by sub possible.  Since it can be empty, be careful
@@ -251,32 +302,66 @@ $chk_signoff = 0 if ($file);
 my @rawlines = ();
 my @lines = ();
 my $vname;
-for my $filename (@ARGV) {
-	my $FILE;
-	if ($file) {
-		open($FILE, '-|', "diff -u /dev/null $filename") ||
-			die "$P: $filename: diff failed - $!\n";
-	} elsif ($filename eq '-') {
-		open($FILE, '<&STDIN');
-	} else {
-		open($FILE, '<', "$filename") ||
-			die "$P: $filename: open failed - $!\n";
-	}
-	if ($filename eq '-') {
-		$vname = 'Your patch';
-	} else {
-		$vname = $filename;
-	}
-	while (<$FILE>) {
+if ($chk_branch) {
+	my @patches;
+	my $HASH;
+	open($HASH, "-|", "git", "log", "--format=%H", $ARGV[0]) ||
+		die "$P: git log --format=%H $ARGV[0] failed - $!\n";
+
+	while (<$HASH>) {
 		chomp;
-		push(@rawlines, $_);
+		push @patches, $_;
 	}
-	close($FILE);
-	if (!process($filename)) {
-		$exit = 1;
+
+	close $HASH;
+
+	die "$P: no revisions returned for revlist '$chk_branch'\n"
+	    unless @patches;
+
+	for my $hash (@patches) {
+		my $FILE;
+		open($FILE, '-|', "git", "show", $hash) ||
+			die "$P: git show $hash - $!\n";
+		$vname = $hash;
+		while (<$FILE>) {
+			chomp;
+			push(@rawlines, $_);
+		}
+		close($FILE);
+		if (!process($hash)) {
+			$exit = 1;
+		}
+		@rawlines = ();
+		@lines = ();
 	}
-	@rawlines = ();
-	@lines = ();
+} else {
+	for my $filename (@ARGV) {
+		my $FILE;
+		if ($file) {
+			open($FILE, '-|', "diff -u /dev/null $filename") ||
+				die "$P: $filename: diff failed - $!\n";
+		} elsif ($filename eq '-') {
+			open($FILE, '<&STDIN');
+		} else {
+			open($FILE, '<', "$filename") ||
+				die "$P: $filename: open failed - $!\n";
+		}
+		if ($filename eq '-') {
+			$vname = 'Your patch';
+		} else {
+			$vname = $filename;
+		}
+		while (<$FILE>) {
+			chomp;
+			push(@rawlines, $_);
+		}
+		close($FILE);
+		if (!process($filename)) {
+			$exit = 1;
+		}
+		@rawlines = ();
+		@lines = ();
+	}
 }
 
 exit($exit);
@@ -1335,6 +1420,25 @@ sub process {
 			my $herevet = "$here\n" . cat_vet($rawline) . "\n";
 			ERROR("trailing whitespace\n" . $herevet);
 			$rpt_cleaners = 1;
+		}
+
+# checks for trace-events files
+		if ($realfile =~ /trace-events$/ && $line =~ /^\+/) {
+			if ($rawline =~ /%[-+ 0]*#/) {
+				ERROR("Don't use '#' flag of printf format ('%#') in " .
+				      "trace-events, use '0x' prefix instead\n" . $herecurr);
+			} else {
+				my $hex =
+					qr/%[-+ *.0-9]*([hljztL]|ll|hh)?(x|X|"\s*PRI[xX][^"]*"?)/;
+
+				# don't consider groups splitted by [.:/ ], like 2A.20:12ab
+				my $tmpline = $rawline =~ s/($hex[.:\/ ])+$hex//gr;
+
+				if ($tmpline =~ /(?<!0x)$hex/) {
+					ERROR("Hex numbers must be prefixed with '0x'\n" .
+					      $herecurr);
+				}
+			}
 		}
 
 # check we are in a valid source file if not then ignore this hunk
@@ -2473,6 +2577,10 @@ sub process {
 		if ($line =~ /\b(strto[^kd].*?)\s*\(/) {
 			ERROR("consider using qemu_$1 in preference to $1\n" . $herecurr);
 		}
+# recommend sigaction over signal for portability, when establishing a handler
+		if ($line =~ /\bsignal\s*\(/ && !($line =~ /SIG_(?:IGN|DFL)/)) {
+			ERROR("use sigaction to establish signal handlers; signal is not portable\n" . $herecurr);
+		}
 # check for module_init(), use category-specific init macros explicitly please
 		if ($line =~ /^module_init\s*\(/) {
 			ERROR("please use block_init(), type_init() etc. instead of module_init()\n" . $herecurr);
@@ -2529,9 +2637,14 @@ sub process {
 				error_setg_file_open|
 				error_set|
 				error_prepend|
+				warn_reportf_err|
 				error_reportf_err|
 				error_vreport|
-				error_report}x;
+				warn_vreport|
+				info_vreport|
+				error_report|
+				warn_report|
+				info_report}x;
 
 	if ($rawline =~ /\b(?:$qemu_error_funcs)\s*\(.*\".*\\n/) {
 		ERROR("Error messages should not contain newlines\n" . $herecurr);

@@ -79,6 +79,7 @@ struct VirtIODevice
     uint16_t queue_sel;
     uint64_t guest_features;
     uint64_t host_features;
+    uint64_t backend_features;
     size_t config_len;
     void *config;
     uint16_t config_vector;
@@ -187,7 +188,7 @@ void virtqueue_get_avail_bytes(VirtQueue *vq, unsigned int *in_bytes,
 void virtio_notify_irqfd(VirtIODevice *vdev, VirtQueue *vq);
 void virtio_notify(VirtIODevice *vdev, VirtQueue *vq);
 
-void virtio_save(VirtIODevice *vdev, QEMUFile *f);
+int virtio_save(VirtIODevice *vdev, QEMUFile *f);
 
 extern const VMStateInfo virtio_vmstate_info;
 

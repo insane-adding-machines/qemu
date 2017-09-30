@@ -74,30 +74,20 @@ static void tricore_testboard_init(MachineState *machine, int board_id)
     if (!machine->cpu_model) {
         machine->cpu_model = "tc1796";
     }
-    cpu = cpu_tricore_init(machine->cpu_model);
-    if (!cpu) {
-        error_report("Unable to find CPU definition");
-        exit(1);
-    }
+    cpu = TRICORE_CPU(cpu_generic_init(TYPE_TRICORE_CPU, machine->cpu_model));
     env = &cpu->env;
-    memory_region_init_ram(ext_cram, NULL, "powerlink_ext_c.ram", 2*1024*1024,
+    memory_region_init_ram(ext_cram, NULL, "powerlink_ext_c.ram",
+                           2 * 1024 * 1024, &error_fatal);
+    memory_region_init_ram(ext_dram, NULL, "powerlink_ext_d.ram",
+                           4 * 1024 * 1024, &error_fatal);
+    memory_region_init_ram(int_cram, NULL, "powerlink_int_c.ram", 48 * 1024,
                            &error_fatal);
-    vmstate_register_ram_global(ext_cram);
-    memory_region_init_ram(ext_dram, NULL, "powerlink_ext_d.ram", 4*1024*1024,
+    memory_region_init_ram(int_dram, NULL, "powerlink_int_d.ram", 48 * 1024,
                            &error_fatal);
-    vmstate_register_ram_global(ext_dram);
-    memory_region_init_ram(int_cram, NULL, "powerlink_int_c.ram", 48*1024,
-                           &error_fatal);
-    vmstate_register_ram_global(int_cram);
-    memory_region_init_ram(int_dram, NULL, "powerlink_int_d.ram", 48*1024,
-                           &error_fatal);
-    vmstate_register_ram_global(int_dram);
-    memory_region_init_ram(pcp_data, NULL, "powerlink_pcp_data.ram", 16*1024,
-                           &error_fatal);
-    vmstate_register_ram_global(pcp_data);
-    memory_region_init_ram(pcp_text, NULL, "powerlink_pcp_text.ram", 32*1024,
-                           &error_fatal);
-    vmstate_register_ram_global(pcp_text);
+    memory_region_init_ram(pcp_data, NULL, "powerlink_pcp_data.ram",
+                           16 * 1024, &error_fatal);
+    memory_region_init_ram(pcp_text, NULL, "powerlink_pcp_text.ram",
+                           32 * 1024, &error_fatal);
 
     memory_region_add_subregion(sysmem, 0x80000000, ext_cram);
     memory_region_add_subregion(sysmem, 0xa1000000, ext_dram);

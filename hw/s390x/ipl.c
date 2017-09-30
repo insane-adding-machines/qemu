@@ -396,7 +396,7 @@ void s390_reipl_request(void)
     S390IPLState *ipl = get_ipl_device();
 
     ipl->reipl_requested = true;
-    qemu_system_reset_request();
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
 }
 
 void s390_ipl_prepare_cpu(S390CPU *cpu)
@@ -418,7 +418,7 @@ void s390_ipl_prepare_cpu(S390CPU *cpu)
             error_report_err(err);
             vm_stop(RUN_STATE_INTERNAL_ERROR);
         }
-        ipl->iplb.ccw.netboot_start_addr = ipl->start_addr;
+        ipl->iplb.ccw.netboot_start_addr = cpu_to_be64(ipl->start_addr);
     }
 }
 
@@ -442,6 +442,8 @@ static void s390_ipl_class_init(ObjectClass *klass, void *data)
     dc->reset = s390_ipl_reset;
     dc->vmsd = &vmstate_ipl;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+    /* Reason: Loads the ROMs and thus can only be used one time - internally */
+    dc->user_creatable = false;
 }
 
 static const TypeInfo s390_ipl_info = {

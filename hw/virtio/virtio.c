@@ -21,7 +21,6 @@
 #include "hw/virtio/virtio.h"
 #include "qemu/atomic.h"
 #include "hw/virtio/virtio-bus.h"
-#include "migration/migration.h"
 #include "hw/virtio/virtio-access.h"
 #include "sysemu/dma.h"
 
@@ -816,6 +815,7 @@ static void *virtqueue_alloc_element(size_t sz, unsigned out_num, unsigned in_nu
 
     assert(sz >= sizeof(VirtQueueElement));
     elem = g_malloc(out_sg_end);
+    trace_virtqueue_alloc_element(elem, sz, in_num, out_num);
     elem->out_num = out_num;
     elem->in_num = in_num;
     elem->in_addr = (void *)elem + in_addr_ofs;
@@ -1025,11 +1025,9 @@ void *qemu_get_virtqueue_element(VirtIODevice *vdev, QEMUFile *f, size_t sz)
 
     /* TODO: teach all callers that this can fail, and return failure instead
      * of asserting here.
-     * When we do, we might be able to re-enable NDEBUG below.
+     * This is just one thing (there are probably more) that must be
+     * fixed before we can allow NDEBUG compilation.
      */
-#ifdef NDEBUG
-#error building with NDEBUG is not supported
-#endif
     assert(ARRAY_SIZE(data.in_addr) >= data.in_num);
     assert(ARRAY_SIZE(data.out_addr) >= data.out_num);
 
@@ -1899,7 +1897,7 @@ static const VMStateDescription vmstate_virtio = {
     }
 };
 
-void virtio_save(VirtIODevice *vdev, QEMUFile *f)
+int virtio_save(VirtIODevice *vdev, QEMUFile *f)
 {
     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
@@ -1949,20 +1947,21 @@ void virtio_save(VirtIODevice *vdev, QEMUFile *f)
     }
 
     if (vdc->vmsd) {
-        vmstate_save_state(f, vdc->vmsd, vdev, NULL);
+        int ret = vmstate_save_state(f, vdc->vmsd, vdev, NULL);
+        if (ret) {
+            return ret;
+        }
     }
 
     /* Subsections */
-    vmstate_save_state(f, &vmstate_virtio, vdev, NULL);
+    return vmstate_save_state(f, &vmstate_virtio, vdev, NULL);
 }
 
 /* A wrapper for use as a VMState .put function */
 static int virtio_device_put(QEMUFile *f, void *opaque, size_t size,
                               VMStateField *field, QJSON *vmdesc)
 {
-    virtio_save(VIRTIO_DEVICE(opaque), f);
-
-    return 0;
+    return virtio_save(VIRTIO_DEVICE(opaque), f);
 }
 
 /* A wrapper for use as a VMState .get function */
@@ -2451,12 +2450,12 @@ void GCC_FMT_ATTR(2, 3) virtio_error(VirtIODevice *vdev, const char *fmt, ...)
     error_vreport(fmt, ap);
     va_end(ap);
 
-    vdev->broken = true;
-
     if (virtio_vdev_has_feature(vdev, VIRTIO_F_VERSION_1)) {
         virtio_set_status(vdev, vdev->status | VIRTIO_CONFIG_S_NEEDS_RESET);
         virtio_notify_config(vdev);
     }
+
+    vdev->broken = true;
 }
 
 static void virtio_memory_listener_commit(MemoryListener *listener)

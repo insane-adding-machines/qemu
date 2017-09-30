@@ -35,15 +35,9 @@ typedef abi_ulong tb_page_addr_t;
 typedef ram_addr_t tb_page_addr_t;
 #endif
 
-/* is_jmp field values */
-#define DISAS_NEXT    0 /* next instruction can be analyzed */
-#define DISAS_JUMP    1 /* only pc was modified dynamically */
-#define DISAS_UPDATE  2 /* cpu state was modified dynamically */
-#define DISAS_TB_JUMP 3 /* only pc was modified statically */
-
 #include "qemu/log.h"
 
-void gen_intermediate_code(CPUArchState *env, struct TranslationBlock *tb);
+void gen_intermediate_code(CPUState *cpu, struct TranslationBlock *tb);
 void restore_state_to_opc(CPUArchState *env, struct TranslationBlock *tb,
                           target_ulong *data);
 
@@ -82,6 +76,9 @@ void cpu_reloading_memory_map(void);
  * Note that with KVM only one address space is supported.
  */
 void cpu_address_space_init(CPUState *cpu, AddressSpace *as, int asidx);
+#endif
+
+#if !defined(CONFIG_USER_ONLY) && defined(CONFIG_TCG)
 /* cputlb.c */
 /**
  * tlb_flush_page:
@@ -287,6 +284,9 @@ static inline void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *cpu,
                                                        uint16_t idxmap)
 {
 }
+static inline void tb_invalidate_phys_addr(AddressSpace *as, hwaddr addr)
+{
+}
 #endif
 
 #define CODE_GEN_ALIGN           16 /* must be >= of the size of a icache line */
@@ -299,15 +299,6 @@ static inline void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *cpu,
 #define CODE_GEN_AVG_BLOCK_SIZE 400
 #else
 #define CODE_GEN_AVG_BLOCK_SIZE 150
-#endif
-
-#if defined(__arm__) || defined(_ARCH_PPC) \
-    || defined(__x86_64__) || defined(__i386__) \
-    || defined(__sparc__) || defined(__aarch64__) \
-    || defined(__s390x__) || defined(__mips__) \
-    || defined(CONFIG_TCG_INTERPRETER)
-/* NOTE: Direct jump patching must be atomic to be thread-safe. */
-#define USE_DIRECT_JUMP
 #endif
 
 struct TranslationBlock {
@@ -323,6 +314,9 @@ struct TranslationBlock {
 #define CF_NOCACHE     0x10000 /* To be freed after execution */
 #define CF_USE_ICOUNT  0x20000
 #define CF_IGNORE_ICOUNT 0x40000 /* Do not generate icount code */
+
+    /* Per-vCPU dynamic tracing state used to generate this TB */
+    uint32_t trace_vcpu_dstate;
 
     uint16_t invalid;
 
@@ -344,11 +338,8 @@ struct TranslationBlock {
      */
     uint16_t jmp_reset_offset[2]; /* offset of original jump target */
 #define TB_JMP_RESET_OFFSET_INVALID 0xffff /* indicates no jump generated */
-#ifdef USE_DIRECT_JUMP
-    uint16_t jmp_insn_offset[2]; /* offset of native jump instruction */
-#else
-    uintptr_t jmp_target_addr[2]; /* target address for indirect jump */
-#endif
+    uintptr_t jmp_target_arg[2];  /* target address or offset */
+
     /* Each TB has an assosiated circular list of TBs jumping to this one.
      * jmp_list_first points to the first TB jumping to this one.
      * jmp_list_next is used to point to the next TB in a list.
@@ -368,87 +359,9 @@ struct TranslationBlock {
 void tb_free(TranslationBlock *tb);
 void tb_flush(CPUState *cpu);
 void tb_phys_invalidate(TranslationBlock *tb, tb_page_addr_t page_addr);
-
-#if defined(USE_DIRECT_JUMP)
-
-#if defined(CONFIG_TCG_INTERPRETER)
-static inline void tb_set_jmp_target1(uintptr_t jmp_addr, uintptr_t addr)
-{
-    /* patch the branch destination */
-    atomic_set((int32_t *)jmp_addr, addr - (jmp_addr + 4));
-    /* no need to flush icache explicitly */
-}
-#elif defined(_ARCH_PPC)
-void ppc_tb_set_jmp_target(uintptr_t jmp_addr, uintptr_t addr);
-#define tb_set_jmp_target1 ppc_tb_set_jmp_target
-#elif defined(__i386__) || defined(__x86_64__)
-static inline void tb_set_jmp_target1(uintptr_t jmp_addr, uintptr_t addr)
-{
-    /* patch the branch destination */
-    atomic_set((int32_t *)jmp_addr, addr - (jmp_addr + 4));
-    /* no need to flush icache explicitly */
-}
-#elif defined(__s390x__)
-static inline void tb_set_jmp_target1(uintptr_t jmp_addr, uintptr_t addr)
-{
-    /* patch the branch destination */
-    intptr_t disp = addr - (jmp_addr - 2);
-    atomic_set((int32_t *)jmp_addr, disp / 2);
-    /* no need to flush icache explicitly */
-}
-#elif defined(__aarch64__)
-void aarch64_tb_set_jmp_target(uintptr_t jmp_addr, uintptr_t addr);
-#define tb_set_jmp_target1 aarch64_tb_set_jmp_target
-#elif defined(__arm__)
-void arm_tb_set_jmp_target(uintptr_t jmp_addr, uintptr_t addr);
-#define tb_set_jmp_target1 arm_tb_set_jmp_target
-#elif defined(__sparc__) || defined(__mips__)
-void tb_set_jmp_target1(uintptr_t jmp_addr, uintptr_t addr);
-#else
-#error tb_set_jmp_target1 is missing
-#endif
-
-static inline void tb_set_jmp_target(TranslationBlock *tb,
-                                     int n, uintptr_t addr)
-{
-    uint16_t offset = tb->jmp_insn_offset[n];
-    tb_set_jmp_target1((uintptr_t)(tb->tc_ptr + offset), addr);
-}
-
-#else
-
-/* set the jump target */
-static inline void tb_set_jmp_target(TranslationBlock *tb,
-                                     int n, uintptr_t addr)
-{
-    tb->jmp_target_addr[n] = addr;
-}
-
-#endif
-
-/* Called with tb_lock held.  */
-static inline void tb_add_jump(TranslationBlock *tb, int n,
-                               TranslationBlock *tb_next)
-{
-    assert(n < ARRAY_SIZE(tb->jmp_list_next));
-    if (tb->jmp_list_next[n]) {
-        /* Another thread has already done this while we were
-         * outside of the lock; nothing to do in this case */
-        return;
-    }
-    qemu_log_mask_and_addr(CPU_LOG_EXEC, tb->pc,
-                           "Linking TBs %p [" TARGET_FMT_lx
-                           "] index %d -> %p [" TARGET_FMT_lx "]\n",
-                           tb->tc_ptr, tb->pc, n,
-                           tb_next->tc_ptr, tb_next->pc);
-
-    /* patch the native jump address */
-    tb_set_jmp_target(tb, n, (uintptr_t)tb_next->tc_ptr);
-
-    /* add in TB jmp circular list */
-    tb->jmp_list_next[n] = tb_next->jmp_list_first;
-    tb_next->jmp_list_first = (uintptr_t)tb | n;
-}
+TranslationBlock *tb_htable_lookup(CPUState *cpu, target_ulong pc,
+                                   target_ulong cs_base, uint32_t flags);
+void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr);
 
 /* GETPC is the true target of the return instruction that we'll execute.  */
 #if defined(CONFIG_TCG_INTERPRETER)
@@ -467,6 +380,10 @@ extern uintptr_t tci_tb_ptr;
    is also the case that there are no host isas that contain a call insn
    smaller than 4 bytes, so we don't worry about special-casing this.  */
 #define GETPC_ADJ   2
+
+void tb_lock(void);
+void tb_unlock(void);
+void tb_lock_reset(void);
 
 #if !defined(CONFIG_USER_ONLY)
 

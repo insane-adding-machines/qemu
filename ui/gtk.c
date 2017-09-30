@@ -54,7 +54,7 @@
 #include "qmp-commands.h"
 #include "x_keymap.h"
 #include "keymaps.h"
-#include "sysemu/char.h"
+#include "chardev/char.h"
 #include "qom/object.h"
 
 #define MAX_VCS 10
@@ -912,9 +912,9 @@ static gboolean gd_motion_event(GtkWidget *widget, GdkEventMotion *motion,
             return TRUE;
         }
         qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_X, x,
-                             surface_width(vc->gfx.ds));
+                             0, surface_width(vc->gfx.ds));
         qemu_input_queue_abs(vc->gfx.dcl.con, INPUT_AXIS_Y, y,
-                             surface_height(vc->gfx.ds));
+                             0, surface_height(vc->gfx.ds));
         qemu_input_event_sync();
     } else if (s->last_set && s->ptr_owner == vc) {
         qemu_input_queue_rel(vc->gfx.dcl.con, INPUT_AXIS_X, x - s->last_x);

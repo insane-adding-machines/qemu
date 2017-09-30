@@ -42,11 +42,7 @@ static void an5206_init(MachineState *machine)
     if (!cpu_model) {
         cpu_model = "m5206";
     }
-    cpu = cpu_m68k_init(cpu_model);
-    if (!cpu) {
-        error_report("Unable to find m68k CPU definition");
-        exit(1);
-    }
+    cpu = M68K_CPU(cpu_generic_init(TYPE_M68K_CPU, cpu_model));
     env = &cpu->env;
 
     /* Initialize CPU registers.  */
@@ -61,7 +57,6 @@ static void an5206_init(MachineState *machine)
 
     /* Internal SRAM.  */
     memory_region_init_ram(sram, NULL, "an5206.sram", 512, &error_fatal);
-    vmstate_register_ram_global(sram);
     memory_region_add_subregion(address_space_mem, AN5206_RAMBAR_ADDR, sram);
 
     mcf5206_init(address_space_mem, AN5206_MBAR_ADDR, cpu);

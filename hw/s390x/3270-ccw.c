@@ -98,9 +98,13 @@ static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
     EmulatedCcw3270Class *ck = EMULATED_CCW_3270_GET_CLASS(dev);
     CcwDevice *cdev = CCW_DEVICE(ds);
     CCWDeviceClass *cdk = CCW_DEVICE_GET_CLASS(cdev);
-    SubchDev *sch = css_create_virtual_sch(cdev->devno, errp);
+    DeviceState *parent = DEVICE(cdev);
+    BusState *qbus = qdev_get_parent_bus(parent);
+    VirtualCssBus *cbus = VIRTUAL_CSS_BUS(qbus);
+    SubchDev *sch;
     Error *err = NULL;
 
+    sch = css_create_sch(cdev->devno, true, cbus->squash_mcss, errp);
     if (!sch) {
         return;
     }
@@ -122,6 +126,7 @@ static void emulated_ccw_3270_realize(DeviceState *ds, Error **errp)
     sch->id.cu_type = EMULATED_CCW_3270_CU_TYPE;
     css_sch_build_virtual_schib(sch, (uint8_t)chpid,
                                 EMULATED_CCW_3270_CHPID_TYPE);
+    sch->do_subchannel_work = do_subchannel_work_virtual;
     sch->ccw_cb = emulated_ccw_3270_cb;
 
     ck->init(dev, &err);

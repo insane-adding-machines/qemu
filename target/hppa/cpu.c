@@ -22,7 +22,6 @@
 #include "qapi/error.h"
 #include "cpu.h"
 #include "qemu-common.h"
-#include "migration/vmstate.h"
 #include "exec/exec-all.h"
 
 
@@ -113,15 +112,9 @@ static void hppa_cpu_initfn(Object *obj)
     hppa_translate_init();
 }
 
-HPPACPU *cpu_hppa_init(const char *cpu_model)
+static ObjectClass *hppa_cpu_class_by_name(const char *cpu_model)
 {
-    HPPACPU *cpu;
-
-    cpu = HPPA_CPU(object_new(TYPE_HPPA_CPU));
-
-    object_property_set_bool(OBJECT(cpu), true, "realized", NULL);
-
-    return cpu;
+    return object_class_by_name(TYPE_HPPA_CPU);
 }
 
 static void hppa_cpu_class_init(ObjectClass *oc, void *data)
@@ -133,6 +126,7 @@ static void hppa_cpu_class_init(ObjectClass *oc, void *data)
     acc->parent_realize = dc->realize;
     dc->realize = hppa_cpu_realizefn;
 
+    cc->class_by_name = hppa_cpu_class_by_name;
     cc->do_interrupt = hppa_cpu_do_interrupt;
     cc->cpu_exec_interrupt = hppa_cpu_exec_interrupt;
     cc->dump_state = hppa_cpu_dump_state;

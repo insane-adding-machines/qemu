@@ -29,6 +29,7 @@
 #include "qemu/option.h"
 #include "qemu/queue.h"
 #include "qemu/coroutine.h"
+#include "qemu/stats64.h"
 #include "qemu/timer.h"
 #include "qapi-types.h"
 #include "qemu/hbitmap.h"
@@ -36,11 +37,11 @@
 #include "qemu/main-loop.h"
 #include "qemu/throttle.h"
 
-#define BLOCK_FLAG_ENCRYPT          1
 #define BLOCK_FLAG_LAZY_REFCOUNTS   8
 
 #define BLOCK_OPT_SIZE              "size"
 #define BLOCK_OPT_ENCRYPT           "encryption"
+#define BLOCK_OPT_ENCRYPT_FORMAT    "encrypt.format"
 #define BLOCK_OPT_COMPAT6           "compat6"
 #define BLOCK_OPT_HWVERSION         "hwversion"
 #define BLOCK_OPT_BACKING_FILE      "backing_file"
@@ -86,7 +87,11 @@ struct BlockDriver {
     const char *format_name;
     int instance_size;
 
-    /* set to true if the BlockDriver is a block filter */
+    /* set to true if the BlockDriver is a block filter. Block filters pass
+     * certain callbacks that refer to data (see block.c) to their bs->file if
+     * the driver doesn't implement them. Drivers that do not wish to forward
+     * must implement them and return -ENOTSUP.
+     */
     bool is_filter;
     /* for snapshots block filter like Quorum can implement the
      * following recursive callback.
@@ -126,7 +131,6 @@ struct BlockDriver {
                           Error **errp);
     void (*bdrv_close)(BlockDriverState *bs);
     int (*bdrv_create)(const char *filename, QemuOpts *opts, Error **errp);
-    int (*bdrv_set_key)(BlockDriverState *bs, const char *key);
     int (*bdrv_make_empty)(BlockDriverState *bs);
 
     void (*bdrv_refresh_filename)(BlockDriverState *bs, QDict *options);
@@ -141,17 +145,48 @@ struct BlockDriver {
     BlockAIOCB *(*bdrv_aio_flush)(BlockDriverState *bs,
         BlockCompletionFunc *cb, void *opaque);
     BlockAIOCB *(*bdrv_aio_pdiscard)(BlockDriverState *bs,
-        int64_t offset, int count,
+        int64_t offset, int bytes,
         BlockCompletionFunc *cb, void *opaque);
 
     int coroutine_fn (*bdrv_co_readv)(BlockDriverState *bs,
         int64_t sector_num, int nb_sectors, QEMUIOVector *qiov);
+
+    /**
+     * @offset: position in bytes to read at
+     * @bytes: number of bytes to read
+     * @qiov: the buffers to fill with read data
+     * @flags: currently unused, always 0
+     *
+     * @offset and @bytes will be a multiple of 'request_alignment',
+     * but the length of individual @qiov elements does not have to
+     * be a multiple.
+     *
+     * @bytes will always equal the total size of @qiov, and will be
+     * no larger than 'max_transfer'.
+     *
+     * The buffer in @qiov may point directly to guest memory.
+     */
     int coroutine_fn (*bdrv_co_preadv)(BlockDriverState *bs,
         uint64_t offset, uint64_t bytes, QEMUIOVector *qiov, int flags);
     int coroutine_fn (*bdrv_co_writev)(BlockDriverState *bs,
         int64_t sector_num, int nb_sectors, QEMUIOVector *qiov);
     int coroutine_fn (*bdrv_co_writev_flags)(BlockDriverState *bs,
         int64_t sector_num, int nb_sectors, QEMUIOVector *qiov, int flags);
+    /**
+     * @offset: position in bytes to write at
+     * @bytes: number of bytes to write
+     * @qiov: the buffers containing data to write
+     * @flags: zero or more bits allowed by 'supported_write_flags'
+     *
+     * @offset and @bytes will be a multiple of 'request_alignment',
+     * but the length of individual @qiov elements does not have to
+     * be a multiple.
+     *
+     * @bytes will always equal the total size of @qiov, and will be
+     * no larger than 'max_transfer'.
+     *
+     * The buffer in @qiov may point directly to guest memory.
+     */
     int coroutine_fn (*bdrv_co_pwritev)(BlockDriverState *bs,
         uint64_t offset, uint64_t bytes, QEMUIOVector *qiov, int flags);
 
@@ -162,9 +197,9 @@ struct BlockDriver {
      * will be called instead.
      */
     int coroutine_fn (*bdrv_co_pwrite_zeroes)(BlockDriverState *bs,
-        int64_t offset, int count, BdrvRequestFlags flags);
+        int64_t offset, int bytes, BdrvRequestFlags flags);
     int coroutine_fn (*bdrv_co_pdiscard)(BlockDriverState *bs,
-        int64_t offset, int count);
+        int64_t offset, int bytes);
 
     /*
      * Building block for bdrv_block_status[_above]. The driver should
@@ -203,11 +238,14 @@ struct BlockDriver {
     int coroutine_fn (*bdrv_co_flush_to_os)(BlockDriverState *bs);
 
     const char *protocol_name;
-    int (*bdrv_truncate)(BlockDriverState *bs, int64_t offset, Error **errp);
+    int (*bdrv_truncate)(BlockDriverState *bs, int64_t offset,
+                         PreallocMode prealloc, Error **errp);
 
     int64_t (*bdrv_getlength)(BlockDriverState *bs);
     bool has_variable_length;
     int64_t (*bdrv_get_allocated_file_size)(BlockDriverState *bs);
+    BlockMeasureInfo *(*bdrv_measure)(QemuOpts *opts, BlockDriverState *in_bs,
+                                      Error **errp);
 
     int coroutine_fn (*bdrv_co_pwritev_compressed)(BlockDriverState *bs,
         uint64_t offset, uint64_t bytes, QEMUIOVector *qiov);
@@ -241,7 +279,6 @@ struct BlockDriver {
 
     /* removable device specific */
     bool (*bdrv_is_inserted)(BlockDriverState *bs);
-    int (*bdrv_media_changed)(BlockDriverState *bs);
     void (*bdrv_eject)(BlockDriverState *bs, bool eject_flag);
     void (*bdrv_lock_medium)(BlockDriverState *bs, bool locked);
 
@@ -320,7 +357,7 @@ struct BlockDriver {
      * Drain and stop any internal sources of requests in the driver, and
      * remain so until next I/O callback (e.g. bdrv_co_writev) is called.
      */
-    void (*bdrv_drain)(BlockDriverState *bs);
+    void coroutine_fn (*bdrv_co_drain)(BlockDriverState *bs);
 
     void (*bdrv_add_child)(BlockDriverState *parent, BlockDriverState *child,
                            Error **errp);
@@ -374,11 +411,30 @@ struct BlockDriver {
      *
      * If @c is NULL, return the permissions for attaching a new child for the
      * given @role.
+     *
+     * If @reopen_queue is non-NULL, don't return the currently needed
+     * permissions, but those that will be needed after applying the
+     * @reopen_queue.
      */
      void (*bdrv_child_perm)(BlockDriverState *bs, BdrvChild *c,
                              const BdrvChildRole *role,
+                             BlockReopenQueue *reopen_queue,
                              uint64_t parent_perm, uint64_t parent_shared,
                              uint64_t *nperm, uint64_t *nshared);
+
+    /**
+     * Bitmaps should be marked as 'IN_USE' in the image on reopening image
+     * as rw. This handler should realize it. It also should unset readonly
+     * field of BlockDirtyBitmap's in case of success.
+     */
+    int (*bdrv_reopen_bitmaps_rw)(BlockDriverState *bs, Error **errp);
+    bool (*bdrv_can_store_new_dirty_bitmap)(BlockDriverState *bs,
+                                            const char *name,
+                                            uint32_t granularity,
+                                            Error **errp);
+    void (*bdrv_remove_persistent_dirty_bitmap)(BlockDriverState *bs,
+                                                const char *name,
+                                                Error **errp);
 
     QLIST_ENTRY(BlockDriver) list;
 };
@@ -528,10 +584,10 @@ struct BlockDriverState {
     int open_flags; /* flags used to open the file, re-used for re-open */
     bool read_only; /* if true, the media is read only */
     bool encrypted; /* if true, the media is encrypted */
-    bool valid_key; /* if true, a valid encryption key has been set */
     bool sg;        /* if true, the device is a /dev/sg* */
     bool probed;    /* if true, format was probed rather than specified */
     bool force_share; /* if true, always allow all shared permissions */
+    bool implicit;  /* if true, this filter node was automatically inserted */
 
     BlockDriver *drv; /* NULL means no media */
     void *opaque;
@@ -595,48 +651,66 @@ struct BlockDriverState {
 
     /* Protected by AioContext lock */
 
-    /* If true, copy read backing sectors into image.  Can be >1 if more
-     * than one client has requested copy-on-read.
-     */
-    int copy_on_read;
-
     /* If we are reading a disk image, give its size in sectors.
-     * Generally read-only; it is written to by load_vmstate and save_vmstate,
-     * but the block layer is quiescent during those.
+     * Generally read-only; it is written to by load_snapshot and
+     * save_snaphost, but the block layer is quiescent during those.
      */
     int64_t total_sectors;
 
     /* Callback before write request is processed */
     NotifierWithReturnList before_write_notifiers;
 
-    /* number of in-flight requests; overall and serialising */
-    unsigned int in_flight;
-    unsigned int serialising_in_flight;
-
-    bool wakeup;
-
-    /* Offset after the highest byte written to */
-    uint64_t wr_highest_offset;
-
     /* threshold limit for writes, in bytes. "High water mark". */
     uint64_t write_threshold_offset;
     NotifierWithReturn write_threshold_notifier;
 
-    /* counter for nested bdrv_io_plug */
-    unsigned io_plugged;
-
-    QLIST_HEAD(, BdrvTrackedRequest) tracked_requests;
-    CoQueue flush_queue;                  /* Serializing flush queue */
-    bool active_flush_req;                /* Flush request in flight? */
-    unsigned int write_gen;               /* Current data generation */
-    unsigned int flushed_gen;             /* Flushed write generation */
-
+    /* Writing to the list requires the BQL _and_ the dirty_bitmap_mutex.
+     * Reading from the list can be done with either the BQL or the
+     * dirty_bitmap_mutex.  Modifying a bitmap only requires
+     * dirty_bitmap_mutex.  */
+    QemuMutex dirty_bitmap_mutex;
     QLIST_HEAD(, BdrvDirtyBitmap) dirty_bitmaps;
+
+    /* Offset after the highest byte written to */
+    Stat64 wr_highest_offset;
+
+    /* If true, copy read backing sectors into image.  Can be >1 if more
+     * than one client has requested copy-on-read.  Accessed with atomic
+     * ops.
+     */
+    int copy_on_read;
+
+    /* number of in-flight requests; overall and serialising.
+     * Accessed with atomic ops.
+     */
+    unsigned int in_flight;
+    unsigned int serialising_in_flight;
+
+    /* Internal to BDRV_POLL_WHILE and bdrv_wakeup.  Accessed with atomic
+     * ops.
+     */
+    bool wakeup;
+
+    /* counter for nested bdrv_io_plug.
+     * Accessed with atomic ops.
+    */
+    unsigned io_plugged;
 
     /* do we need to tell the quest if we have a volatile write cache? */
     int enable_write_cache;
 
+    /* Accessed with atomic ops.  */
     int quiesce_counter;
+    unsigned int write_gen;               /* Current data generation */
+
+    /* Protected by reqs_lock.  */
+    CoMutex reqs_lock;
+    QLIST_HEAD(, BdrvTrackedRequest) tracked_requests;
+    CoQueue flush_queue;                  /* Serializing flush queue */
+    bool active_flush_req;                /* Flush request in flight? */
+
+    /* Only read/written by whoever has set active_flush_req to true.  */
+    unsigned int flushed_gen;             /* Flushed write generation */
 };
 
 struct BlockBackendRootState {
@@ -681,6 +755,9 @@ int coroutine_fn bdrv_co_pwritev(BdrvChild *child,
 int get_tmp_filename(char *filename, int size);
 BlockDriver *bdrv_probe_all(const uint8_t *buf, int buf_size,
                             const char *filename);
+
+void bdrv_parse_filename_strip_prefix(const char *filename, const char *prefix,
+                                      QDict *options);
 
 
 /**
@@ -911,6 +988,7 @@ int bdrv_child_try_set_perm(BdrvChild *c, uint64_t perm, uint64_t shared,
  * all children */
 void bdrv_filter_default_perms(BlockDriverState *bs, BdrvChild *c,
                                const BdrvChildRole *role,
+                               BlockReopenQueue *reopen_queue,
                                uint64_t perm, uint64_t shared,
                                uint64_t *nperm, uint64_t *nshared);
 
@@ -920,9 +998,28 @@ void bdrv_filter_default_perms(BlockDriverState *bs, BdrvChild *c,
  * CONSISTENT_READ and doesn't share WRITE. */
 void bdrv_format_default_perms(BlockDriverState *bs, BdrvChild *c,
                                const BdrvChildRole *role,
+                               BlockReopenQueue *reopen_queue,
                                uint64_t perm, uint64_t shared,
                                uint64_t *nperm, uint64_t *nshared);
 
+/*
+ * Default implementation for drivers to pass bdrv_co_get_block_status() to
+ * their file.
+ */
+int64_t coroutine_fn bdrv_co_get_block_status_from_file(BlockDriverState *bs,
+                                                        int64_t sector_num,
+                                                        int nb_sectors,
+                                                        int *pnum,
+                                                        BlockDriverState **file);
+/*
+ * Default implementation for drivers to pass bdrv_co_get_block_status() to
+ * their backing file.
+ */
+int64_t coroutine_fn bdrv_co_get_block_status_from_backing(BlockDriverState *bs,
+                                                           int64_t sector_num,
+                                                           int nb_sectors,
+                                                           int *pnum,
+                                                           BlockDriverState **file);
 const char *bdrv_get_parent_name(const BlockDriverState *bs);
 void blk_dev_change_media_cb(BlockBackend *blk, bool load, Error **errp);
 bool blk_dev_has_removable_media(BlockBackend *blk);

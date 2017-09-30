@@ -100,9 +100,9 @@ ETEXI
 
     {
         .name       = "registers",
-        .args_type  = "",
-        .params     = "",
-        .help       = "show the cpu registers",
+        .args_type  = "cpustate_all:-a",
+        .params     = "[-a]",
+        .help       = "show the cpu registers (-a: all - show register info for all cpus)",
         .cmd        = hmp_info_registers,
     },
 
@@ -115,9 +115,10 @@ ETEXI
 #if defined(TARGET_I386)
     {
         .name       = "lapic",
-        .args_type  = "",
-        .params     = "",
-        .help       = "show local apic state",
+        .args_type  = "apic-id:i?",
+        .params     = "[apic-id]",
+        .help       = "show local apic state (apic-id: local apic to read, default is which of current CPU)",
+
         .cmd        = hmp_info_local_apic,
     },
 #endif
@@ -249,9 +250,10 @@ ETEXI
 
     {
         .name       = "mtree",
-        .args_type  = "flatview:-f",
-        .params     = "[-f]",
-        .help       = "show memory tree (-f: dump flat view for address spaces)",
+        .args_type  = "flatview:-f,dispatch_tree:-d",
+        .params     = "[-f][-d]",
+        .help       = "show memory tree (-f: dump flat view for address spaces;"
+                      "-d: dump dispatch tree, valid with -f only)",
         .cmd        = hmp_info_mtree,
     },
 
@@ -261,6 +263,7 @@ STEXI
 Show memory tree.
 ETEXI
 
+#if defined(CONFIG_TCG)
     {
         .name       = "jit",
         .args_type  = "",
@@ -268,6 +271,7 @@ ETEXI
         .help       = "show dynamic compiler info",
         .cmd        = hmp_info_jit,
     },
+#endif
 
 STEXI
 @item info jit
@@ -275,6 +279,7 @@ STEXI
 Show dynamic compiler info.
 ETEXI
 
+#if defined(CONFIG_TCG)
     {
         .name       = "opcount",
         .args_type  = "",
@@ -282,6 +287,7 @@ ETEXI
         .help       = "show dynamic compiler opcode counters",
         .cmd        = hmp_info_opcount,
     },
+#endif
 
 STEXI
 @item info opcount
@@ -773,6 +779,22 @@ STEXI
 Display the value of a storage key (s390 only)
 ETEXI
 
+#if defined(TARGET_S390X)
+    {
+        .name       = "cmma",
+        .args_type  = "addr:l,count:l?",
+        .params     = "address [count]",
+        .help       = "Display the values of the CMMA storage attributes for a range of pages",
+        .cmd        = hmp_info_cmma,
+    },
+#endif
+
+STEXI
+@item info cmma @var{address}
+@findex cmma
+Display the values of the CMMA storage attributes for a range of pages (s390 only)
+ETEXI
+
     {
         .name       = "dump",
         .args_type  = "",
@@ -785,6 +807,20 @@ STEXI
 @item info dump
 @findex dump
 Display the latest dump status.
+ETEXI
+
+    {
+        .name       = "ramblock",
+        .args_type  = "",
+        .params     = "",
+        .help       = "Display system ramblock information",
+        .cmd        = hmp_info_ramblock,
+    },
+
+STEXI
+@item info ramblock
+@findex ramblock
+Dump all the ramblocks of the system.
 ETEXI
 
     {
@@ -813,6 +849,22 @@ ETEXI
         .params     = "",
         .help       = "Show Virtual Machine Generation ID",
         .cmd = hmp_info_vm_generation_id,
+    },
+
+STEXI
+@item info memory_size_summary
+@findex memory_size_summary
+Display the amount of initially allocated and present hotpluggable (if
+enabled) memory in bytes.
+ETEXI
+
+    {
+        .name       = "memory_size_summary",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show the amount of initially allocated and "
+                      "present hotpluggable (if enabled) memory in bytes.",
+        .cmd        = hmp_info_memory_size_summary,
     },
 
 STEXI

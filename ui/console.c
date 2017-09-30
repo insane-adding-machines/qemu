@@ -27,7 +27,7 @@
 #include "hw/qdev-core.h"
 #include "qemu/timer.h"
 #include "qmp-commands.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
 #include "trace.h"
 #include "exec/memory.h"
 
@@ -880,8 +880,9 @@ static void console_putchar(QemuConsole *s, int ch)
         } else {
             if (s->nb_esc_params < MAX_ESC_PARAMS)
                 s->nb_esc_params++;
-            if (ch == ';')
+            if (ch == ';' || ch == '?') {
                 break;
+            }
             trace_console_putchar_csi(s->esc_params[0], s->esc_params[1],
                                       ch, s->nb_esc_params);
             s->state = TTY_STATE_NORM;
@@ -1540,7 +1541,7 @@ void dpy_gfx_replace_surface(QemuConsole *con,
     DisplaySurface *old_surface = con->surface;
     DisplayChangeListener *dcl;
 
-    assert(old_surface != surface);
+    assert(old_surface != surface || surface == NULL);
 
     con->surface = surface;
     QLIST_FOREACH(dcl, &s->listeners, next) {
@@ -1579,36 +1580,13 @@ bool dpy_gfx_check_format(QemuConsole *con,
     return true;
 }
 
-/*
- * Safe DPY refresh for TCG guests. We use the exclusive mechanism to
- * ensure the TCG vCPUs are quiescent so we can avoid races between
- * dirty page tracking for direct frame-buffer access by the guest.
- *
- * This is a temporary stopgap until we've fixed the dirty tracking
- * races in display adapters.
- */
-static void do_safe_dpy_refresh(DisplayChangeListener *dcl)
-{
-    qemu_mutex_unlock_iothread();
-    start_exclusive();
-    qemu_mutex_lock_iothread();
-    dcl->ops->dpy_refresh(dcl);
-    qemu_mutex_unlock_iothread();
-    end_exclusive();
-    qemu_mutex_lock_iothread();
-}
-
 static void dpy_refresh(DisplayState *s)
 {
     DisplayChangeListener *dcl;
 
     QLIST_FOREACH(dcl, &s->listeners, next) {
         if (dcl->ops->dpy_refresh) {
-            if (tcg_enabled()) {
-                do_safe_dpy_refresh(dcl);
-            } else {
-                dcl->ops->dpy_refresh(dcl);
-            }
+            dcl->ops->dpy_refresh(dcl);
         }
     }
 }
@@ -1872,8 +1850,8 @@ QemuConsole *qemu_console_lookup_by_device(DeviceState *dev, uint32_t head)
         if (DEVICE(obj) != dev) {
             continue;
         }
-        h = object_property_get_int(OBJECT(consoles[i]),
-                                    "head", &error_abort);
+        h = object_property_get_uint(OBJECT(consoles[i]),
+                                     "head", &error_abort);
         if (h != head) {
             continue;
         }

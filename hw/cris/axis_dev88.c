@@ -271,7 +271,7 @@ void axisdev88_init(MachineState *machine)
     if (cpu_model == NULL) {
         cpu_model = "crisv32";
     }
-    cpu = cpu_cris_init(cpu_model);
+    cpu = CRIS_CPU(cpu_generic_init(TYPE_CRIS_CPU, cpu_model));
     env = &cpu->env;
 
     /* allocate RAM */
@@ -281,9 +281,8 @@ void axisdev88_init(MachineState *machine)
 
     /* The ETRAX-FS has 128Kb on chip ram, the docs refer to it as the 
        internal memory.  */
-    memory_region_init_ram(phys_intmem, NULL, "axisdev88.chipram", INTMEM_SIZE,
-                           &error_fatal);
-    vmstate_register_ram_global(phys_intmem);
+    memory_region_init_ram(phys_intmem, NULL, "axisdev88.chipram",
+                           INTMEM_SIZE, &error_fatal);
     memory_region_add_subregion(address_space_mem, 0x38000000, phys_intmem);
 
       /* Attach a NAND flash to CS1.  */

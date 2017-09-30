@@ -31,7 +31,6 @@
 #include "block/thread-pool.h"
 #include "qemu/iov.h"
 #include "qapi/qmp/qstring.h"
-#include "qapi/util.h"
 #include <windows.h>
 #include <winioctl.h>
 
@@ -276,12 +275,7 @@ static void raw_parse_flags(int flags, bool use_aio, int *access_flags,
 static void raw_parse_filename(const char *filename, QDict *options,
                                Error **errp)
 {
-    /* The filename does not have to be prefixed by the protocol name, since
-     * "file" is the default protocol; therefore, the return value of this
-     * function call can be ignored. */
-    strstart(filename, "file:", &filename);
-
-    qdict_put_str(options, "filename", filename);
+    bdrv_parse_filename_strip_prefix(filename, "file:", options);
 }
 
 static QemuOptsList raw_runtime_opts = {
@@ -308,8 +302,8 @@ static bool get_aio_option(QemuOpts *opts, int flags, Error **errp)
 
     aio_default = (flags & BDRV_O_NATIVE_AIO) ? BLOCKDEV_AIO_OPTIONS_NATIVE
                                               : BLOCKDEV_AIO_OPTIONS_THREADS;
-    aio = qapi_enum_parse(BlockdevAioOptions_lookup, qemu_opt_get(opts, "aio"),
-                          BLOCKDEV_AIO_OPTIONS__MAX, aio_default, errp);
+    aio = qapi_enum_parse(&BlockdevAioOptions_lookup, qemu_opt_get(opts, "aio"),
+                          aio_default, errp);
 
     switch (aio) {
     case BLOCKDEV_AIO_OPTIONS_NATIVE:
@@ -346,6 +340,7 @@ static int raw_open(BlockDriverState *bs, QDict *options, int flags,
 
     if (qdict_get_try_bool(options, "locking", false)) {
         error_setg(errp, "locking=on is not supported on Windows");
+        ret = -EINVAL;
         goto fail;
     }
 
@@ -465,11 +460,18 @@ static void raw_close(BlockDriverState *bs)
     }
 }
 
-static int raw_truncate(BlockDriverState *bs, int64_t offset, Error **errp)
+static int raw_truncate(BlockDriverState *bs, int64_t offset,
+                        PreallocMode prealloc, Error **errp)
 {
     BDRVRawState *s = bs->opaque;
     LONG low, high;
     DWORD dwPtrLow;
+
+    if (prealloc != PREALLOC_MODE_OFF) {
+        error_setg(errp, "Unsupported preallocation mode '%s'",
+                   PreallocMode_str(prealloc));
+        return -ENOTSUP;
+    }
 
     low = offset;
     high = offset >> 32;
@@ -670,10 +672,7 @@ static int hdev_probe_device(const char *filename)
 static void hdev_parse_filename(const char *filename, QDict *options,
                                 Error **errp)
 {
-    /* The prefix is optional, just as for "file". */
-    strstart(filename, "host_device:", &filename);
-
-    qdict_put_str(options, "filename", filename);
+    bdrv_parse_filename_strip_prefix(filename, "host_device:", options);
 }
 
 static int hdev_open(BlockDriverState *bs, QDict *options, int flags,

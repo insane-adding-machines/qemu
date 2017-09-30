@@ -31,6 +31,7 @@
 #include "sysemu/block-backend.h"
 #include "exec/address-spaces.h"
 #include "sysemu/qtest.h"
+#include "qemu/error-report.h"
 
 #define MAX_IDE_BUS 2
 
@@ -53,9 +54,9 @@ static void mips_qemu_write (void *opaque, hwaddr addr,
                              uint64_t val, unsigned size)
 {
     if ((addr & 0xffff) == 0 && val == 42)
-        qemu_system_reset_request ();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     else if ((addr & 0xffff) == 4 && val == 42)
-        qemu_system_shutdown_request ();
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
 }
 
 static uint64_t mips_qemu_read (void *opaque, hwaddr addr,
@@ -96,8 +97,9 @@ static int64_t load_kernel(void)
         if ((entry & ~0x7fffffffULL) == 0x80000000)
             entry = (int32_t)entry;
     } else {
-        fprintf(stderr, "qemu: could not load kernel '%s'\n",
-                loaderparams.kernel_filename);
+        error_report("qemu: could not load kernel '%s': %s",
+                     loaderparams.kernel_filename,
+                     load_elf_strerror(kernel_size));
         exit(1);
     }
 
@@ -191,11 +193,7 @@ void mips_r4k_init(MachineState *machine)
         cpu_model = "24Kf";
 #endif
     }
-    cpu = cpu_mips_init(cpu_model);
-    if (cpu == NULL) {
-        fprintf(stderr, "Unable to find CPU definition\n");
-        exit(1);
-    }
+    cpu = MIPS_CPU(cpu_generic_init(TYPE_MIPS_CPU, cpu_model));
     env = &cpu->env;
 
     reset_info = g_malloc0(sizeof(ResetData));
@@ -238,7 +236,6 @@ void mips_r4k_init(MachineState *machine)
         bios = g_new(MemoryRegion, 1);
         memory_region_init_ram(bios, NULL, "mips_r4k.bios", BIOS_SIZE,
                                &error_fatal);
-        vmstate_register_ram_global(bios);
         memory_region_set_readonly(bios, true);
         memory_region_add_subregion(get_system_memory(), 0x1fc00000, bios);
 
@@ -252,9 +249,8 @@ void mips_r4k_init(MachineState *machine)
             fprintf(stderr, "qemu: Error registering flash memory.\n");
 	}
     } else if (!qtest_enabled()) {
-	/* not fatal */
-        fprintf(stderr, "qemu: Warning, could not load MIPS bios '%s'\n",
-		bios_name);
+        /* not fatal */
+        warn_report("could not load MIPS bios '%s'", bios_name);
     }
     g_free(filename);
 

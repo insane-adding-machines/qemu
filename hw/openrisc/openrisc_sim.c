@@ -109,18 +109,13 @@ static void openrisc_sim_init(MachineState *machine)
     }
 
     for (n = 0; n < smp_cpus; n++) {
-        cpu = cpu_openrisc_init(cpu_model);
-        if (cpu == NULL) {
-            fprintf(stderr, "Unable to find CPU definition!\n");
-            exit(1);
-        }
+        cpu = OPENRISC_CPU(cpu_generic_init(TYPE_OPENRISC_CPU, cpu_model));
         qemu_register_reset(main_cpu_reset, cpu);
         main_cpu_reset(cpu);
     }
 
     ram = g_malloc(sizeof(*ram));
     memory_region_init_ram(ram, NULL, "openrisc.ram", ram_size, &error_fatal);
-    vmstate_register_ram_global(ram);
     memory_region_add_subregion(get_system_memory(), 0, ram);
 
     cpu_openrisc_pic_init(cpu);

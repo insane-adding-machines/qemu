@@ -33,6 +33,7 @@
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_bus.h"
 #include "qemu/range.h"
+#include "qapi/error.h"
 
 /* PCI bridge subsystem vendor ID helper functions */
 #define PCI_SSVID_SIZEOF        8
@@ -40,10 +41,13 @@
 #define PCI_SSVID_SSID          6
 
 int pci_bridge_ssvid_init(PCIDevice *dev, uint8_t offset,
-                          uint16_t svid, uint16_t ssid)
+                          uint16_t svid, uint16_t ssid,
+                          Error **errp)
 {
     int pos;
-    pos = pci_add_capability(dev, PCI_CAP_ID_SSVID, offset, PCI_SSVID_SIZEOF);
+
+    pos = pci_add_capability(dev, PCI_CAP_ID_SSVID, offset,
+                             PCI_SSVID_SIZEOF, errp);
     if (pos < 0) {
         return pos;
     }
@@ -402,6 +406,52 @@ void pci_bridge_map_irq(PCIBridge *br, const char* bus_name,
 {
     br->map_irq = map_irq;
     br->bus_name = bus_name;
+}
+
+
+int pci_bridge_qemu_reserve_cap_init(PCIDevice *dev, int cap_offset,
+                                     uint32_t bus_reserve, uint64_t io_reserve,
+                                     uint32_t mem_non_pref_reserve,
+                                     uint32_t mem_pref_32_reserve,
+                                     uint64_t mem_pref_64_reserve,
+                                     Error **errp)
+{
+    if (mem_pref_32_reserve != (uint32_t)-1 &&
+        mem_pref_64_reserve != (uint64_t)-1) {
+        error_setg(errp,
+                   "PCI resource reserve cap: PREF32 and PREF64 conflict");
+        return -EINVAL;
+    }
+
+    if (bus_reserve == (uint32_t)-1 &&
+        io_reserve == (uint64_t)-1 &&
+        mem_non_pref_reserve == (uint32_t)-1 &&
+        mem_pref_32_reserve == (uint32_t)-1 &&
+        mem_pref_64_reserve == (uint64_t)-1) {
+        return 0;
+    }
+
+    size_t cap_len = sizeof(PCIBridgeQemuCap);
+    PCIBridgeQemuCap cap = {
+            .len = cap_len,
+            .type = REDHAT_PCI_CAP_RESOURCE_RESERVE,
+            .bus_res = bus_reserve,
+            .io = io_reserve,
+            .mem = mem_non_pref_reserve,
+            .mem_pref_32 = mem_pref_32_reserve,
+            .mem_pref_64 = mem_pref_64_reserve
+    };
+
+    int offset = pci_add_capability(dev, PCI_CAP_ID_VNDR,
+                                    cap_offset, cap_len, errp);
+    if (offset < 0) {
+        return offset;
+    }
+
+    memcpy(dev->config + offset + PCI_CAP_FLAGS,
+           (char *)&cap + PCI_CAP_FLAGS,
+           cap_len - PCI_CAP_FLAGS);
+    return 0;
 }
 
 static const TypeInfo pci_bridge_type_info = {

@@ -19,6 +19,7 @@
 #include "qemu/host-utils.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/kvm.h"
+#include "sysemu/hw_accel.h"
 #include "kvm_i386.h"
 #include "hw/sysbus.h"
 #include "hw/kvm/clock.h"
@@ -68,6 +69,8 @@ static uint64_t kvmclock_current_nsec(KVMClockState *s)
     uint64_t nsec_lo;
     uint64_t nsec_hi;
     uint64_t nsec;
+
+    cpu_synchronize_state(cpu);
 
     if (!(env->system_time_msr & 1ULL)) {
         /* KVM clock not active */
@@ -251,11 +254,13 @@ static const VMStateDescription kvmclock_reliable_get_clock = {
  *  final pages of memory (which happens between vm_stop()
  *  and pre_save()) takes max_downtime.
  */
-static void kvmclock_pre_save(void *opaque)
+static int kvmclock_pre_save(void *opaque)
 {
     KVMClockState *s = opaque;
 
     kvm_update_clock(s);
+
+    return 0;
 }
 
 static const VMStateDescription kvmclock_vmsd = {

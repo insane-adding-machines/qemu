@@ -17,10 +17,12 @@
  */
 
 #include "qemu/osdep.h"
-
-#include "qemu-common.h"
-#include "migration/migration.h"
+#include "exec/target_page.h"
+#include "migration.h"
+#include "qemu-file.h"
+#include "savevm.h"
 #include "postcopy-ram.h"
+#include "ram.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/balloon.h"
 #include "qemu/error-report.h"
@@ -59,15 +61,66 @@ struct PostcopyDiscardState {
 #include <sys/eventfd.h>
 #include <linux/userfaultfd.h>
 
-static bool ufd_version_check(int ufd)
-{
-    struct uffdio_api api_struct;
-    uint64_t ioctl_mask;
 
+/**
+ * receive_ufd_features: check userfault fd features, to request only supported
+ * features in the future.
+ *
+ * Returns: true on success
+ *
+ * __NR_userfaultfd - should be checked before
+ *  @features: out parameter will contain uffdio_api.features provided by kernel
+ *              in case of success
+ */
+static bool receive_ufd_features(uint64_t *features)
+{
+    struct uffdio_api api_struct = {0};
+    int ufd;
+    bool ret = true;
+
+    /* if we are here __NR_userfaultfd should exists */
+    ufd = syscall(__NR_userfaultfd, O_CLOEXEC);
+    if (ufd == -1) {
+        error_report("%s: syscall __NR_userfaultfd failed: %s", __func__,
+                     strerror(errno));
+        return false;
+    }
+
+    /* ask features */
     api_struct.api = UFFD_API;
     api_struct.features = 0;
     if (ioctl(ufd, UFFDIO_API, &api_struct)) {
-        error_report("postcopy_ram_supported_by_host: UFFDIO_API failed: %s",
+        error_report("%s: UFFDIO_API failed: %s", __func__,
+                     strerror(errno));
+        ret = false;
+        goto release_ufd;
+    }
+
+    *features = api_struct.features;
+
+release_ufd:
+    close(ufd);
+    return ret;
+}
+
+/**
+ * request_ufd_features: this function should be called only once on a newly
+ * opened ufd, subsequent calls will lead to error.
+ *
+ * Returns: true on succes
+ *
+ * @ufd: fd obtained from userfaultfd syscall
+ * @features: bit mask see UFFD_API_FEATURES
+ */
+static bool request_ufd_features(int ufd, uint64_t features)
+{
+    struct uffdio_api api_struct = {0};
+    uint64_t ioctl_mask;
+
+    api_struct.api = UFFD_API;
+    api_struct.features = features;
+    if (ioctl(ufd, UFFDIO_API, &api_struct)) {
+        error_report("%s failed: UFFDIO_API failed: %s", __func__,
                      strerror(errno));
         return false;
     }
@@ -80,11 +133,42 @@ static bool ufd_version_check(int ufd)
         return false;
     }
 
+    return true;
+}
+
+static bool ufd_check_and_apply(int ufd, MigrationIncomingState *mis)
+{
+    uint64_t asked_features = 0;
+    static uint64_t supported_features;
+
+    /*
+     * it's not possible to
+     * request UFFD_API twice per one fd
+     * userfault fd features is persistent
+     */
+    if (!supported_features) {
+        if (!receive_ufd_features(&supported_features)) {
+            error_report("%s failed", __func__);
+            return false;
+        }
+    }
+
+    /*
+     * request features, even if asked_features is 0, due to
+     * kernel expects UFFD_API before UFFDIO_REGISTER, per
+     * userfault file descriptor
+     */
+    if (!request_ufd_features(ufd, asked_features)) {
+        error_report("%s failed: features %" PRIu64, __func__,
+                     asked_features);
+        return false;
+    }
+
     if (getpagesize() != ram_pagesize_summary()) {
         bool have_hp = false;
         /* We've got a huge page */
 #ifdef UFFD_FEATURE_MISSING_HUGETLBFS
-        have_hp = api_struct.features & UFFD_FEATURE_MISSING_HUGETLBFS;
+        have_hp = supported_features & UFFD_FEATURE_MISSING_HUGETLBFS;
 #endif
         if (!have_hp) {
             error_report("Userfault on this host does not support huge pages");
@@ -96,12 +180,22 @@ static bool ufd_version_check(int ufd)
 
 /* Callback from postcopy_ram_supported_by_host block iterator.
  */
-static int test_range_shared(const char *block_name, void *host_addr,
+static int test_ramblock_postcopiable(const char *block_name, void *host_addr,
                              ram_addr_t offset, ram_addr_t length, void *opaque)
 {
-    if (qemu_ram_is_shared(qemu_ram_block_by_name(block_name))) {
+    RAMBlock *rb = qemu_ram_block_by_name(block_name);
+    size_t pagesize = qemu_ram_pagesize(rb);
+
+    if (qemu_ram_is_shared(rb)) {
         error_report("Postcopy on shared RAM (%s) is not yet supported",
                      block_name);
+        return 1;
+    }
+
+    if (length % pagesize) {
+        error_report("Postcopy requires RAM blocks to be a page size multiple,"
+                     " block %s is 0x" RAM_ADDR_FMT " bytes with a "
+                     "page size of 0x%zx", block_name, length, pagesize);
         return 1;
     }
     return 0;
@@ -112,7 +206,7 @@ static int test_range_shared(const char *block_name, void *host_addr,
  * normally fine since if the postcopy succeeds it gets turned back on at the
  * end.
  */
-bool postcopy_ram_supported_by_host(void)
+bool postcopy_ram_supported_by_host(MigrationIncomingState *mis)
 {
     long pagesize = getpagesize();
     int ufd = -1;
@@ -135,12 +229,12 @@ bool postcopy_ram_supported_by_host(void)
     }
 
     /* Version and features check */
-    if (!ufd_version_check(ufd)) {
+    if (!ufd_check_and_apply(ufd, mis)) {
         goto out;
     }
 
     /* We don't support postcopy with shared RAM yet */
-    if (qemu_ram_foreach_block(test_range_shared, NULL)) {
+    if (qemu_ram_foreach_block(test_ramblock_postcopiable, NULL)) {
         goto out;
     }
 
@@ -320,7 +414,6 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
     }
 
     postcopy_state_set(POSTCOPY_INCOMING_END);
-    migrate_send_rp_shut(mis, qemu_file_get_error(mis->from_src_file) != 0);
 
     if (mis->postcopy_tmp_page) {
         munmap(mis->postcopy_tmp_page, mis->largest_page_size);
@@ -512,7 +605,7 @@ int postcopy_ram_enable_notify(MigrationIncomingState *mis)
      * Although the host check already tested the API, we need to
      * do the check again as an ABI handshake on the new fd.
      */
-    if (!ufd_version_check(mis->userfault_fd)) {
+    if (!ufd_check_and_apply(mis->userfault_fd, mis)) {
         return -1;
     }
 
@@ -650,7 +743,7 @@ void *postcopy_get_tmp_page(MigrationIncomingState *mis)
 
 #else
 /* No target OS support, stubs just fail */
-bool postcopy_ram_supported_by_host(void)
+bool postcopy_ram_supported_by_host(MigrationIncomingState *mis)
 {
     error_report("%s: No OS support", __func__);
     return false;
@@ -783,4 +876,22 @@ void postcopy_discard_send_finish(MigrationState *ms, PostcopyDiscardState *pds)
                                        pds->nsentcmds);
 
     g_free(pds);
+}
+
+/*
+ * Current state of incoming postcopy; note this is not part of
+ * MigrationIncomingState since it's state is used during cleanup
+ * at the end as MIS is being freed.
+ */
+static PostcopyState incoming_postcopy_state;
+
+PostcopyState  postcopy_state_get(void)
+{
+    return atomic_mb_read(&incoming_postcopy_state);
+}
+
+/* Set the state and return the old state */
+PostcopyState postcopy_state_set(PostcopyState new_state)
+{
+    return atomic_xchg(&incoming_postcopy_state, new_state);
 }
