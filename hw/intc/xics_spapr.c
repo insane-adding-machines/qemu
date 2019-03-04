@@ -31,10 +31,11 @@
 #include "trace.h"
 #include "qemu/timer.h"
 #include "hw/ppc/spapr.h"
+#include "hw/ppc/spapr_cpu_core.h"
 #include "hw/ppc/xics.h"
+#include "hw/ppc/xics_spapr.h"
 #include "hw/ppc/fdt.h"
 #include "qapi/visitor.h"
-#include "qapi/error.h"
 
 /*
  * Guest interfaces
@@ -45,7 +46,7 @@ static target_ulong h_cppr(PowerPCCPU *cpu, sPAPRMachineState *spapr,
 {
     target_ulong cppr = args[0];
 
-    icp_set_cppr(ICP(cpu->intc), cppr);
+    icp_set_cppr(spapr_cpu_state(cpu)->icp, cppr);
     return H_SUCCESS;
 }
 
@@ -66,7 +67,7 @@ static target_ulong h_ipi(PowerPCCPU *cpu, sPAPRMachineState *spapr,
 static target_ulong h_xirr(PowerPCCPU *cpu, sPAPRMachineState *spapr,
                            target_ulong opcode, target_ulong *args)
 {
-    uint32_t xirr = icp_accept(ICP(cpu->intc));
+    uint32_t xirr = icp_accept(spapr_cpu_state(cpu)->icp);
 
     args[0] = xirr;
     return H_SUCCESS;
@@ -75,7 +76,7 @@ static target_ulong h_xirr(PowerPCCPU *cpu, sPAPRMachineState *spapr,
 static target_ulong h_xirr_x(PowerPCCPU *cpu, sPAPRMachineState *spapr,
                              target_ulong opcode, target_ulong *args)
 {
-    uint32_t xirr = icp_accept(ICP(cpu->intc));
+    uint32_t xirr = icp_accept(spapr_cpu_state(cpu)->icp);
 
     args[0] = xirr;
     args[1] = cpu_get_host_ticks();
@@ -87,7 +88,7 @@ static target_ulong h_eoi(PowerPCCPU *cpu, sPAPRMachineState *spapr,
 {
     target_ulong xirr = args[0];
 
-    icp_eoi(ICP(cpu->intc), xirr);
+    icp_eoi(spapr_cpu_state(cpu)->icp, xirr);
     return H_SUCCESS;
 }
 
@@ -95,7 +96,7 @@ static target_ulong h_ipoll(PowerPCCPU *cpu, sPAPRMachineState *spapr,
                             target_ulong opcode, target_ulong *args)
 {
     uint32_t mfrr;
-    uint32_t xirr = icp_ipoll(ICP(cpu->intc), &mfrr);
+    uint32_t xirr = icp_ipoll(spapr_cpu_state(cpu)->icp, &mfrr);
 
     args[0] = xirr;
     args[1] = mfrr;
@@ -245,130 +246,15 @@ void xics_spapr_init(sPAPRMachineState *spapr)
     spapr_register_hypercall(H_IPOLL, h_ipoll);
 }
 
-#define ICS_IRQ_FREE(ics, srcno)   \
-    (!((ics)->irqs[(srcno)].flags & (XICS_FLAGS_IRQ_MASK)))
-
-static int ics_find_free_block(ICSState *ics, int num, int alignnum)
-{
-    int first, i;
-
-    for (first = 0; first < ics->nr_irqs; first += alignnum) {
-        if (num > (ics->nr_irqs - first)) {
-            return -1;
-        }
-        for (i = first; i < first + num; ++i) {
-            if (!ICS_IRQ_FREE(ics, i)) {
-                break;
-            }
-        }
-        if (i == (first + num)) {
-            return first;
-        }
-    }
-
-    return -1;
-}
-
-int spapr_ics_alloc(ICSState *ics, int irq_hint, bool lsi, Error **errp)
-{
-    int irq;
-
-    if (!ics) {
-        return -1;
-    }
-    if (irq_hint) {
-        if (!ICS_IRQ_FREE(ics, irq_hint - ics->offset)) {
-            error_setg(errp, "can't allocate IRQ %d: already in use", irq_hint);
-            return -1;
-        }
-        irq = irq_hint;
-    } else {
-        irq = ics_find_free_block(ics, 1, 1);
-        if (irq < 0) {
-            error_setg(errp, "can't allocate IRQ: no IRQ left");
-            return -1;
-        }
-        irq += ics->offset;
-    }
-
-    ics_set_irq_type(ics, irq - ics->offset, lsi);
-    trace_xics_alloc(irq);
-
-    return irq;
-}
-
-/*
- * Allocate block of consecutive IRQs, and return the number of the first IRQ in
- * the block. If align==true, aligns the first IRQ number to num.
- */
-int spapr_ics_alloc_block(ICSState *ics, int num, bool lsi,
-                          bool align, Error **errp)
-{
-    int i, first = -1;
-
-    if (!ics) {
-        return -1;
-    }
-
-    /*
-     * MSIMesage::data is used for storing VIRQ so
-     * it has to be aligned to num to support multiple
-     * MSI vectors. MSI-X is not affected by this.
-     * The hint is used for the first IRQ, the rest should
-     * be allocated continuously.
-     */
-    if (align) {
-        assert((num == 1) || (num == 2) || (num == 4) ||
-               (num == 8) || (num == 16) || (num == 32));
-        first = ics_find_free_block(ics, num, num);
-    } else {
-        first = ics_find_free_block(ics, num, 1);
-    }
-    if (first < 0) {
-        error_setg(errp, "can't find a free %d-IRQ block", num);
-        return -1;
-    }
-
-    if (first >= 0) {
-        for (i = first; i < first + num; ++i) {
-            ics_set_irq_type(ics, i, lsi);
-        }
-    }
-    first += ics->offset;
-
-    trace_xics_alloc_block(first, num, lsi, align);
-
-    return first;
-}
-
-static void ics_free(ICSState *ics, int srcno, int num)
-{
-    int i;
-
-    for (i = srcno; i < srcno + num; ++i) {
-        if (ICS_IRQ_FREE(ics, i)) {
-            trace_xics_ics_free_warn(0, i + ics->offset);
-        }
-        memset(&ics->irqs[i], 0, sizeof(ICSIRQState));
-    }
-}
-
-void spapr_ics_free(ICSState *ics, int irq, int num)
-{
-    if (ics_valid_irq(ics, irq)) {
-        trace_xics_ics_free(0, irq, num);
-        ics_free(ics, irq - ics->offset, num);
-    }
-}
-
-void spapr_dt_xics(int nr_servers, void *fdt, uint32_t phandle)
+void spapr_dt_xics(sPAPRMachineState *spapr, uint32_t nr_servers, void *fdt,
+                   uint32_t phandle)
 {
     uint32_t interrupt_server_ranges_prop[] = {
         0, cpu_to_be32(nr_servers),
     };
     int node;
 
-    _FDT(node = fdt_add_subnode(fdt, 0, "interrupt-controller"));
+    _FDT(node = fdt_add_subnode(fdt, 0, XICS_NODENAME));
 
     _FDT(fdt_setprop_string(fdt, node, "device_type",
                             "PowerPC-External-Interrupt-Presentation"));

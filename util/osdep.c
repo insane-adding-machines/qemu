@@ -29,7 +29,7 @@
 #include <sys/statvfs.h>
 /* See MySQL bug #7156 (http://bugs.mysql.com/bug.php?id=7156) for
    discussion about Solaris header problems */
-extern int madvise(caddr_t, size_t, int);
+extern int madvise(char *, size_t, int);
 #endif
 
 #include "qemu-common.h"
@@ -70,6 +70,47 @@ int qemu_madvise(void *addr, size_t len, int advice)
 #else
     errno = EINVAL;
     return -1;
+#endif
+}
+
+static int qemu_mprotect__osdep(void *addr, size_t size, int prot)
+{
+    g_assert(!((uintptr_t)addr & ~qemu_real_host_page_mask));
+    g_assert(!(size & ~qemu_real_host_page_mask));
+
+#ifdef _WIN32
+    DWORD old_protect;
+
+    if (!VirtualProtect(addr, size, prot, &old_protect)) {
+        error_report("%s: VirtualProtect failed with error code %ld",
+                     __func__, GetLastError());
+        return -1;
+    }
+    return 0;
+#else
+    if (mprotect(addr, size, prot)) {
+        error_report("%s: mprotect failed: %s", __func__, strerror(errno));
+        return -1;
+    }
+    return 0;
+#endif
+}
+
+int qemu_mprotect_rwx(void *addr, size_t size)
+{
+#ifdef _WIN32
+    return qemu_mprotect__osdep(addr, size, PAGE_EXECUTE_READWRITE);
+#else
+    return qemu_mprotect__osdep(addr, size, PROT_READ | PROT_WRITE | PROT_EXEC);
+#endif
+}
+
+int qemu_mprotect_none(void *addr, size_t size)
+{
+#ifdef _WIN32
+    return qemu_mprotect__osdep(addr, size, PAGE_NOACCESS);
+#else
+    return qemu_mprotect__osdep(addr, size, PROT_NONE);
 #endif
 }
 
@@ -203,7 +244,9 @@ static int qemu_lock_fcntl(int fd, int64_t start, int64_t len, int fl_type)
         .l_type   = fl_type,
     };
     qemu_probe_lock_ops();
-    ret = fcntl(fd, fcntl_op_setlk, &fl);
+    do {
+        ret = fcntl(fd, fcntl_op_setlk, &fl);
+    } while (ret == -1 && errno == EINTR);
     return ret == -1 ? -errno : 0;
 }
 
@@ -259,7 +302,8 @@ int qemu_open(const char *name, int flags, ...)
         }
 
         fd = monitor_fdset_get_fd(fdset_id, flags);
-        if (fd == -1) {
+        if (fd < 0) {
+            errno = -fd;
             return -1;
         }
 
@@ -426,8 +470,8 @@ void fips_set_state(bool requested)
 
 #ifdef _FIPS_DEBUG
     fprintf(stderr, "FIPS mode %s (requested %s)\n",
-	    (fips_enabled ? "enabled" : "disabled"),
-	    (requested ? "enabled" : "disabled"));
+            (fips_enabled ? "enabled" : "disabled"),
+            (requested ? "enabled" : "disabled"));
 #endif
 }
 
@@ -460,20 +504,6 @@ int socket_init(void)
     return 0;
 }
 
-#if !GLIB_CHECK_VERSION(2, 31, 0)
-/* Ensure that glib is running in multi-threaded mode
- * Old versions of glib require explicit initialization.  Failure to do
- * this results in the single-threaded code paths being taken inside
- * glib.  For example, the g_slice allocator will not be thread-safe
- * and cause crashes.
- */
-static void __attribute__((constructor)) thread_init(void)
-{
-    if (!g_thread_supported()) {
-       g_thread_init(NULL);
-    }
-}
-#endif
 
 #ifndef CONFIG_IOVEC
 /* helper function for iov_send_recv() */

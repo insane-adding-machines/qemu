@@ -113,11 +113,20 @@ static void mips_cpu_reset(CPUState *s)
 }
 
 static void mips_cpu_disas_set_info(CPUState *s, disassemble_info *info) {
+    MIPSCPU *cpu = MIPS_CPU(s);
+    CPUMIPSState *env = &cpu->env;
+
+    if (!(env->insn_flags & ISA_NANOMIPS32)) {
 #ifdef TARGET_WORDS_BIGENDIAN
-    info->print_insn = print_insn_big_mips;
+        info->print_insn = print_insn_big_mips;
 #else
-    info->print_insn = print_insn_little_mips;
+        info->print_insn = print_insn_little_mips;
 #endif
+    } else {
+#if defined(CONFIG_NANOMIPS_DIS)
+        info->print_insn = print_insn_nanomips;
+#endif
+    }
 }
 
 static void mips_cpu_realizefn(DeviceState *dev, Error **errp)
@@ -150,25 +159,17 @@ static void mips_cpu_initfn(Object *obj)
 
     cs->env_ptr = env;
     env->cpu_model = mcc->cpu_def;
-
-    if (tcg_enabled()) {
-        mips_tcg_init();
-    }
 }
 
 static char *mips_cpu_type_name(const char *cpu_model)
 {
-    return g_strdup_printf("%s-" TYPE_MIPS_CPU, cpu_model);
+    return g_strdup_printf(MIPS_CPU_TYPE_NAME("%s"), cpu_model);
 }
 
 static ObjectClass *mips_cpu_class_by_name(const char *cpu_model)
 {
     ObjectClass *oc;
     char *typename;
-
-    if (cpu_model == NULL) {
-        return NULL;
-    }
 
     typename = mips_cpu_type_name(cpu_model);
     oc = object_class_by_name(typename);
@@ -182,9 +183,8 @@ static void mips_cpu_class_init(ObjectClass *c, void *data)
     CPUClass *cc = CPU_CLASS(c);
     DeviceClass *dc = DEVICE_CLASS(c);
 
-    mcc->parent_realize = dc->realize;
-    dc->realize = mips_cpu_realizefn;
-
+    device_class_set_parent_realize(dc, mips_cpu_realizefn,
+                                    &mcc->parent_realize);
     mcc->parent_reset = cc->reset;
     cc->reset = mips_cpu_reset;
 
@@ -206,6 +206,9 @@ static void mips_cpu_class_init(ObjectClass *c, void *data)
     cc->vmsd = &vmstate_mips_cpu;
 #endif
     cc->disas_set_info = mips_cpu_disas_set_info;
+#ifdef CONFIG_TCG
+    cc->tcg_initialize = mips_tcg_init;
+#endif
 
     cc->gdb_num_core_regs = 73;
     cc->gdb_stop_before_watchpoint = true;

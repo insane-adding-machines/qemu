@@ -1,12 +1,10 @@
 #ifndef QEMU_DEVICES_H
 #define QEMU_DEVICES_H
 
-#include "hw/irq.h"
-
-/* ??? Not all users of this file can include cpu-common.h.  */
-struct MemoryRegion;
-
 /* Devices that have nowhere better to go.  */
+
+#include "hw/hw.h"
+#include "ui/console.h"
 
 /* smc91c111.c */
 void smc91c111_init(NICInfo *, uint32_t, qemu_irq);

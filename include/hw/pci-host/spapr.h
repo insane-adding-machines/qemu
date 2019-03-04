@@ -94,12 +94,13 @@ struct sPAPRPHBState {
     ((1ULL << 32) - SPAPR_PCI_MEM_WIN_BUS_OFFSET)
 #define SPAPR_PCI_MEM64_WIN_SIZE     0x10000000000ULL /* 1 TiB */
 
-/* Without manual configuration, all PCI outbound windows will be
- * within this range */
+/* All PCI outbound windows will be within this range */
 #define SPAPR_PCI_BASE               (1ULL << 45) /* 32 TiB */
 #define SPAPR_PCI_LIMIT              (1ULL << 46) /* 64 TiB */
 
-#define SPAPR_PCI_2_7_MMIO_WIN_SIZE  0xf80000000
+#define SPAPR_MAX_PHBS ((SPAPR_PCI_LIMIT - SPAPR_PCI_BASE) / \
+                        SPAPR_PCI_MEM64_WIN_SIZE - 1)
+
 #define SPAPR_PCI_IO_WIN_SIZE        0x10000
 
 #define SPAPR_PCI_MSI_WINDOW         0x40000000000ULL
@@ -108,14 +109,11 @@ static inline qemu_irq spapr_phb_lsi_qirq(struct sPAPRPHBState *phb, int pin)
 {
     sPAPRMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
 
-    return xics_get_qirq(XICS_FABRIC(spapr), phb->lsi_table[pin].irq);
+    return spapr_qirq(spapr, phb->lsi_table[pin].irq);
 }
 
-PCIHostState *spapr_create_phb(sPAPRMachineState *spapr, int index);
-
-int spapr_populate_pci_dt(sPAPRPHBState *phb,
-                          uint32_t xics_phandle,
-                          void *fdt);
+int spapr_populate_pci_dt(sPAPRPHBState *phb, uint32_t intc_phandle, void *fdt,
+                          uint32_t nr_msis, int *node_offset);
 
 void spapr_pci_rtas_init(void);
 
@@ -123,8 +121,10 @@ sPAPRPHBState *spapr_pci_find_phb(sPAPRMachineState *spapr, uint64_t buid);
 PCIDevice *spapr_pci_find_dev(sPAPRMachineState *spapr, uint64_t buid,
                               uint32_t config_addr);
 
-/* PCI release callback. */
+/* DRC callbacks */
 void spapr_phb_remove_pci_device_cb(DeviceState *dev);
+int spapr_pci_dt_populate(sPAPRDRConnector *drc, sPAPRMachineState *spapr,
+                          void *fdt, int *fdt_start_offset, Error **errp);
 
 /* VFIO EEH hooks */
 #ifdef CONFIG_LINUX
@@ -164,5 +164,10 @@ static inline void spapr_phb_vfio_reset(DeviceState *qdev)
 #endif
 
 void spapr_phb_dma_reset(sPAPRPHBState *sphb);
+
+static inline unsigned spapr_phb_windows_supported(sPAPRPHBState *sphb)
+{
+    return sphb->ddw_enabled ? SPAPR_PCI_DMA_MAX_WINDOWS : 1;
+}
 
 #endif /* PCI_HOST_SPAPR_H */

@@ -32,7 +32,7 @@
 #include "qemu/osdep.h"
 #include "qemu-common.h"
 #include "hw/usb.h"
-#include "hw/usb/desc.h"
+#include "desc.h"
 #include "hw/hw.h"
 #include "audio/audio.h"
 
@@ -319,6 +319,9 @@ static int streambuf_put(struct streambuf *buf, USBPacket *p)
     uint32_t free = buf->size - (buf->prod - buf->cons);
 
     if (!free) {
+        return 0;
+    }
+    if (p->iov.size != USBAUDIO_PACKET_SIZE) {
         return 0;
     }
     assert(free >= USBAUDIO_PACKET_SIZE);

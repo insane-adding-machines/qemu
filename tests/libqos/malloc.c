@@ -104,7 +104,7 @@ static void mlist_coalesce(MemList *head, MemBlock *node)
 
     do {
         merge = 0;
-        left = QTAILQ_PREV(node, MemList, MLIST_ENTNAME);
+        left = QTAILQ_PREV(node, MLIST_ENTNAME);
         right = QTAILQ_NEXT(node, MLIST_ENTNAME);
 
         /* clowns to the left of me */
@@ -129,7 +129,7 @@ static MemBlock *mlist_new(uint64_t addr, uint64_t size)
     if (!size) {
         return NULL;
     }
-    block = g_malloc0(sizeof(MemBlock));
+    block = g_new0(MemBlock, 1);
 
     block->addr = addr;
     block->size = size;
@@ -305,8 +305,8 @@ QGuestAllocator *alloc_init(uint64_t start, uint64_t end)
     s->start = start;
     s->end = end;
 
-    s->used = g_malloc(sizeof(MemList));
-    s->free = g_malloc(sizeof(MemList));
+    s->used = g_new(MemList, 1);
+    s->free = g_new(MemList, 1);
     QTAILQ_INIT(s->used);
     QTAILQ_INIT(s->free);
 

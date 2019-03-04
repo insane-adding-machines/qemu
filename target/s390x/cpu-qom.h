@@ -22,7 +22,7 @@
 
 #include "qom/cpu.h"
 
-#define TYPE_S390_CPU "s390-cpu"
+#define TYPE_S390_CPU "s390x-cpu"
 
 #define S390_CPU_CLASS(klass) \
     OBJECT_CLASS_CHECK(S390CPUClass, (klass), TYPE_S390_CPU)
@@ -53,8 +53,6 @@ typedef struct S390CPUClass {
     bool is_static;
     bool is_migration_safe;
     const char *desc;
-
-    uint32_t next_core_id;
 
     DeviceRealize parent_realize;
     void (*parent_reset)(CPUState *cpu);

@@ -45,84 +45,87 @@ typedef struct QPCIBusSPAPR {
 static uint8_t qpci_spapr_pio_readb(QPCIBus *bus, uint32_t addr)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    return readb(s->pio_cpu_base + addr);
+    return qtest_readb(bus->qts, s->pio_cpu_base + addr);
 }
 
 static void qpci_spapr_pio_writeb(QPCIBus *bus, uint32_t addr, uint8_t val)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    writeb(s->pio_cpu_base + addr, val);
+    qtest_writeb(bus->qts, s->pio_cpu_base + addr, val);
 }
 
 static uint16_t qpci_spapr_pio_readw(QPCIBus *bus, uint32_t addr)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    return bswap16(readw(s->pio_cpu_base + addr));
+    return bswap16(qtest_readw(bus->qts, s->pio_cpu_base + addr));
 }
 
 static void qpci_spapr_pio_writew(QPCIBus *bus, uint32_t addr, uint16_t val)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    writew(s->pio_cpu_base + addr, bswap16(val));
+    qtest_writew(bus->qts, s->pio_cpu_base + addr, bswap16(val));
 }
 
 static uint32_t qpci_spapr_pio_readl(QPCIBus *bus, uint32_t addr)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    return bswap32(readl(s->pio_cpu_base + addr));
+    return bswap32(qtest_readl(bus->qts, s->pio_cpu_base + addr));
 }
 
 static void qpci_spapr_pio_writel(QPCIBus *bus, uint32_t addr, uint32_t val)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    writel(s->pio_cpu_base + addr, bswap32(val));
+    qtest_writel(bus->qts, s->pio_cpu_base + addr, bswap32(val));
 }
 
 static uint64_t qpci_spapr_pio_readq(QPCIBus *bus, uint32_t addr)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    return bswap64(readq(s->pio_cpu_base + addr));
+    return bswap64(qtest_readq(bus->qts, s->pio_cpu_base + addr));
 }
 
 static void qpci_spapr_pio_writeq(QPCIBus *bus, uint32_t addr, uint64_t val)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    writeq(s->pio_cpu_base + addr, bswap64(val));
+    qtest_writeq(bus->qts, s->pio_cpu_base + addr, bswap64(val));
 }
 
 static void qpci_spapr_memread(QPCIBus *bus, uint32_t addr,
                                void *buf, size_t len)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    memread(s->mmio32_cpu_base + addr, buf, len);
+    qtest_memread(bus->qts, s->mmio32_cpu_base + addr, buf, len);
 }
 
 static void qpci_spapr_memwrite(QPCIBus *bus, uint32_t addr,
                                 const void *buf, size_t len)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
-    memwrite(s->mmio32_cpu_base + addr, buf, len);
+    qtest_memwrite(bus->qts, s->mmio32_cpu_base + addr, buf, len);
 }
 
 static uint8_t qpci_spapr_config_readb(QPCIBus *bus, int devfn, uint8_t offset)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
     uint32_t config_addr = (devfn << 8) | offset;
-    return qrtas_ibm_read_pci_config(s->alloc, s->buid, config_addr, 1);
+    return qrtas_ibm_read_pci_config(bus->qts, s->alloc, s->buid,
+                                     config_addr, 1);
 }
 
 static uint16_t qpci_spapr_config_readw(QPCIBus *bus, int devfn, uint8_t offset)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
     uint32_t config_addr = (devfn << 8) | offset;
-    return qrtas_ibm_read_pci_config(s->alloc, s->buid, config_addr, 2);
+    return qrtas_ibm_read_pci_config(bus->qts, s->alloc, s->buid,
+                                     config_addr, 2);
 }
 
 static uint32_t qpci_spapr_config_readl(QPCIBus *bus, int devfn, uint8_t offset)
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
     uint32_t config_addr = (devfn << 8) | offset;
-    return qrtas_ibm_read_pci_config(s->alloc, s->buid, config_addr, 4);
+    return qrtas_ibm_read_pci_config(bus->qts, s->alloc, s->buid,
+                                     config_addr, 4);
 }
 
 static void qpci_spapr_config_writeb(QPCIBus *bus, int devfn, uint8_t offset,
@@ -130,7 +133,8 @@ static void qpci_spapr_config_writeb(QPCIBus *bus, int devfn, uint8_t offset,
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
     uint32_t config_addr = (devfn << 8) | offset;
-    qrtas_ibm_write_pci_config(s->alloc, s->buid, config_addr, 1, value);
+    qrtas_ibm_write_pci_config(bus->qts, s->alloc, s->buid,
+                               config_addr, 1, value);
 }
 
 static void qpci_spapr_config_writew(QPCIBus *bus, int devfn, uint8_t offset,
@@ -138,7 +142,8 @@ static void qpci_spapr_config_writew(QPCIBus *bus, int devfn, uint8_t offset,
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
     uint32_t config_addr = (devfn << 8) | offset;
-    qrtas_ibm_write_pci_config(s->alloc, s->buid, config_addr, 2, value);
+    qrtas_ibm_write_pci_config(bus->qts, s->alloc, s->buid,
+                               config_addr, 2, value);
 }
 
 static void qpci_spapr_config_writel(QPCIBus *bus, int devfn, uint8_t offset,
@@ -146,7 +151,8 @@ static void qpci_spapr_config_writel(QPCIBus *bus, int devfn, uint8_t offset,
 {
     QPCIBusSPAPR *s = container_of(bus, QPCIBusSPAPR, bus);
     uint32_t config_addr = (devfn << 8) | offset;
-    qrtas_ibm_write_pci_config(s->alloc, s->buid, config_addr, 4, value);
+    qrtas_ibm_write_pci_config(bus->qts, s->alloc, s->buid,
+                               config_addr, 4, value);
 }
 
 #define SPAPR_PCI_BASE               (1ULL << 45)
@@ -154,11 +160,11 @@ static void qpci_spapr_config_writel(QPCIBus *bus, int devfn, uint8_t offset,
 #define SPAPR_PCI_MMIO32_WIN_SIZE    0x80000000 /* 2 GiB */
 #define SPAPR_PCI_IO_WIN_SIZE        0x10000
 
-QPCIBus *qpci_init_spapr(QGuestAllocator *alloc)
+QPCIBus *qpci_init_spapr(QTestState *qts, QGuestAllocator *alloc)
 {
-    QPCIBusSPAPR *ret;
+    QPCIBusSPAPR *ret = g_new0(QPCIBusSPAPR, 1);
 
-    ret = g_malloc(sizeof(*ret));
+    assert(qts);
 
     ret->alloc = alloc;
 
@@ -197,6 +203,7 @@ QPCIBus *qpci_init_spapr(QGuestAllocator *alloc)
     ret->mmio32.pci_base = SPAPR_PCI_MMIO32_WIN_SIZE;
     ret->mmio32.size = SPAPR_PCI_MMIO32_WIN_SIZE;
 
+    ret->bus.qts = qts;
     ret->bus.pio_alloc_ptr = 0xc000;
     ret->bus.mmio_alloc_ptr = ret->mmio32.pci_base;
     ret->bus.mmio_limit = ret->mmio32.pci_base + ret->mmio32.size;

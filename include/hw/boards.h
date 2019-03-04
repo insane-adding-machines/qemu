@@ -35,8 +35,7 @@
  *
  * Smaller pieces of memory (display RAM, static RAMs, etc) don't need
  * to be backed via the -mem-path memory backend and can simply
- * be created via memory_region_allocate_aux_memory() or
- * memory_region_init_ram().
+ * be created via memory_region_init_ram().
  */
 void memory_region_allocate_system_memory(MemoryRegion *mr, Object *owner,
                                           const char *name,
@@ -70,16 +69,19 @@ int machine_kvm_shadow_mem(MachineState *machine);
 int machine_phandle_start(MachineState *machine);
 bool machine_dump_guest_core(MachineState *machine);
 bool machine_mem_merge(MachineState *machine);
-void machine_register_compat_props(MachineState *machine);
 HotpluggableCPUList *machine_query_hotpluggable_cpus(MachineState *machine);
 void machine_set_cpu_numa_node(MachineState *machine,
                                const CpuInstanceProperties *props,
                                Error **errp);
 
+void machine_class_allow_dynamic_sysbus_dev(MachineClass *mc, const char *type);
+
+
 /**
  * CPUArchId:
  * @arch_id - architecture-dependent CPU ID of present or possible CPU
  * @cpu - pointer to corresponding CPU object if it's present on NULL otherwise
+ * @type - QOM class name of possible @cpu object
  * @props - CPU object properties, initialized by board
  * #vcpus_count - number of threads provided by @cpu object
  */
@@ -88,6 +90,7 @@ typedef struct {
     int64_t vcpus_count;
     CpuInstanceProperties props;
     Object *cpu;
+    const char *type;
 } CPUArchId;
 
 /**
@@ -102,6 +105,11 @@ typedef struct {
 
 /**
  * MachineClass:
+ * @deprecation_reason: If set, the machine is marked as deprecated. The
+ *    string should provide some clear information about what to use instead.
+ * @max_cpus: maximum number of CPUs supported. Default: 1
+ * @min_cpus: minimum number of CPUs supported. Default: 1
+ * @default_cpus: number of CPUs instantiated if none are specified. Default: 1
  * @get_hotplug_handler: this function is called during bus-less
  *    device hotplug. If defined it returns pointer to an instance
  *    of HotplugHandler object, which handles hotplug operation
@@ -158,6 +166,7 @@ struct MachineClass {
     char *name;
     const char *alias;
     const char *desc;
+    const char *deprecation_reason;
 
     void (*init)(MachineState *state);
     void (*reset)(void);
@@ -167,32 +176,37 @@ struct MachineClass {
     BlockInterfaceType block_default_type;
     int units_per_default_bus;
     int max_cpus;
+    int min_cpus;
+    int default_cpus;
     unsigned int no_serial:1,
         no_parallel:1,
-        use_virtcon:1,
-        use_sclp:1,
         no_floppy:1,
         no_cdrom:1,
         no_sdcard:1,
-        has_dynamic_sysbus:1,
         pci_allow_0_address:1,
         legacy_fw_cfg_order:1;
     int is_default;
     const char *default_machine_opts;
     const char *default_boot_order;
     const char *default_display;
-    GArray *compat_props;
+    GPtrArray *compat_props;
     const char *hw_version;
     ram_addr_t default_ram_size;
     const char *default_cpu_type;
+    bool default_kernel_irqchip_split;
     bool option_rom_has_mr;
     bool rom_file_has_mr;
     int minimum_page_bits;
     bool has_hotpluggable_cpus;
     bool ignore_memory_transaction_failures;
     int numa_mem_align_shift;
+    const char **valid_cpu_types;
+    strList *allowed_dynamic_sysbus_devices;
+    bool auto_enable_numa_with_memhp;
     void (*numa_auto_assign_ram)(MachineClass *mc, NodeInfo *nodes,
                                  int nb_nodes, ram_addr_t size);
+    bool ignore_boot_device_suffixes;
+    bool smbus_no_migration_support;
 
     HotplugHandler *(*get_hotplug_handler)(MachineState *machine,
                                            DeviceState *dev);
@@ -201,6 +215,17 @@ struct MachineClass {
     const CPUArchIdList *(*possible_cpu_arch_ids)(MachineState *machine);
     int64_t (*get_default_cpu_node_id)(const MachineState *ms, int idx);
 };
+
+/**
+ * DeviceMemoryState:
+ * @base: address in guest physical address space where the memory
+ * address space for memory devices starts
+ * @mr: address space container for memory devices
+ */
+typedef struct DeviceMemoryState {
+    hwaddr base;
+    MemoryRegion mr;
+} DeviceMemoryState;
 
 /**
  * MachineState:
@@ -231,6 +256,8 @@ struct MachineState {
     bool suppress_vmdesc;
     bool enforce_config_section;
     bool enable_graphics;
+    char *memory_encryption;
+    DeviceMemoryState *device_memory;
 
     ram_addr_t ram_size;
     ram_addr_t maxram_size;
@@ -239,7 +266,6 @@ struct MachineState {
     char *kernel_filename;
     char *kernel_cmdline;
     char *initrd_filename;
-    const char *cpu_model;
     const char *cpu_type;
     AccelState *accelerator;
     CPUArchIdList *possible_cpus;
@@ -262,20 +288,46 @@ struct MachineState {
     } \
     type_init(machine_initfn##_register_types)
 
-#define SET_MACHINE_COMPAT(m, COMPAT) \
-    do {                              \
-        int i;                        \
-        static GlobalProperty props[] = {       \
-            COMPAT                              \
-            { /* end of list */ }               \
-        };                                      \
-        if (!m->compat_props) { \
-            m->compat_props = g_array_new(false, false, sizeof(void *)); \
-        } \
-        for (i = 0; props[i].driver != NULL; i++) {    \
-            GlobalProperty *prop = &props[i];          \
-            g_array_append_val(m->compat_props, prop); \
-        }                                              \
-    } while (0)
+extern GlobalProperty hw_compat_3_1[];
+extern const size_t hw_compat_3_1_len;
+
+extern GlobalProperty hw_compat_3_0[];
+extern const size_t hw_compat_3_0_len;
+
+extern GlobalProperty hw_compat_2_12[];
+extern const size_t hw_compat_2_12_len;
+
+extern GlobalProperty hw_compat_2_11[];
+extern const size_t hw_compat_2_11_len;
+
+extern GlobalProperty hw_compat_2_10[];
+extern const size_t hw_compat_2_10_len;
+
+extern GlobalProperty hw_compat_2_9[];
+extern const size_t hw_compat_2_9_len;
+
+extern GlobalProperty hw_compat_2_8[];
+extern const size_t hw_compat_2_8_len;
+
+extern GlobalProperty hw_compat_2_7[];
+extern const size_t hw_compat_2_7_len;
+
+extern GlobalProperty hw_compat_2_6[];
+extern const size_t hw_compat_2_6_len;
+
+extern GlobalProperty hw_compat_2_5[];
+extern const size_t hw_compat_2_5_len;
+
+extern GlobalProperty hw_compat_2_4[];
+extern const size_t hw_compat_2_4_len;
+
+extern GlobalProperty hw_compat_2_3[];
+extern const size_t hw_compat_2_3_len;
+
+extern GlobalProperty hw_compat_2_2[];
+extern const size_t hw_compat_2_2_len;
+
+extern GlobalProperty hw_compat_2_1[];
+extern const size_t hw_compat_2_1_len;
 
 #endif

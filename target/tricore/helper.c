@@ -4,7 +4,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -19,6 +19,7 @@
 
 #include "cpu.h"
 #include "exec/exec-all.h"
+#include "fpu/softfloat.h"
 
 enum {
     TLBRET_DIRTY = -4,
@@ -100,7 +101,7 @@ void tricore_cpu_list(FILE *f, fprintf_function cpu_fprintf)
     };
     GSList *list;
 
-    list = object_class_get_list(TYPE_TRICORE_CPU, false);
+    list = object_class_get_list_sorted(TYPE_TRICORE_CPU, false);
     (*cpu_fprintf)(f, "Available CPUs:\n");
     g_slist_foreach(list, tricore_cpu_list_entry, &s);
     g_slist_free(list);

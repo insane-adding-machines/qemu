@@ -207,7 +207,6 @@ static const uint64_t stat_bits[] = {
 
 void pnv_psi_irq_set(PnvPsi *psi, PnvPsiIrq irq, bool state)
 {
-    ICSState *ics = &psi->ics;
     uint32_t xivr_reg;
     uint32_t stat_reg;
     uint32_t src;
@@ -227,14 +226,14 @@ void pnv_psi_irq_set(PnvPsi *psi, PnvPsiIrq irq, bool state)
         /* TODO: optimization, check mask here. That means
          * re-evaluating when unmasking
          */
-        qemu_irq_raise(ics->qirqs[src]);
+        qemu_irq_raise(psi->qirqs[src]);
     } else {
         psi->regs[stat_reg] &= ~stat_bits[irq];
 
         /* FSP and PSI are muxed so don't lower if either is still set */
         if (stat_reg != PSIHB_XSCOM_CR ||
             !(psi->regs[stat_reg] & (PSIHB_CR_PSI_IRQ | PSIHB_CR_FSP_IRQ))) {
-            qemu_irq_lower(ics->qirqs[src]);
+            qemu_irq_lower(psi->qirqs[src]);
         } else {
             state = true;
         }
@@ -445,8 +444,8 @@ static void pnv_psi_init(Object *obj)
 {
     PnvPsi *psi = PNV_PSI(obj);
 
-    object_initialize(&psi->ics, sizeof(psi->ics), TYPE_ICS_SIMPLE);
-    object_property_add_child(obj, "ics-psi", OBJECT(&psi->ics), NULL);
+    object_initialize_child(obj, "ics-psi",  &psi->ics, sizeof(psi->ics),
+                            TYPE_ICS_SIMPLE, &error_abort, NULL);
 }
 
 static const uint8_t irq_to_xivr[] = {
@@ -491,6 +490,8 @@ static void pnv_psi_realize(DeviceState *dev, Error **errp)
         ics_set_irq_type(ics, i, true);
     }
 
+    psi->qirqs = qemu_allocate_irqs(ics_simple_set_irq, ics, ics->nr_irqs);
+
     /* XSCOM region for PSI registers */
     pnv_xscom_region_init(&psi->xscom_regs, OBJECT(dev), &pnv_psi_xscom_ops,
                 psi, "xscom-psi", PNV_XSCOM_PSIHB_SIZE);
@@ -510,7 +511,7 @@ static void pnv_psi_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static int pnv_psi_populate(PnvXScomInterface *dev, void *fdt, int xscom_offset)
+static int pnv_psi_dt_xscom(PnvXScomInterface *dev, void *fdt, int xscom_offset)
 {
     const char compat[] = "ibm,power8-psihb-x\0ibm,psihb-x";
     char *name;
@@ -546,7 +547,7 @@ static void pnv_psi_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PnvXScomInterfaceClass *xdc = PNV_XSCOM_INTERFACE_CLASS(klass);
 
-    xdc->populate = pnv_psi_populate;
+    xdc->dt_xscom = pnv_psi_dt_xscom;
 
     dc->realize = pnv_psi_realize;
     dc->props = pnv_psi_properties;

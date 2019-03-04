@@ -791,7 +791,14 @@ static void virtio_scsi_hotplug(HotplugHandler *hotplug_dev, DeviceState *dev,
     SCSIDevice *sd = SCSI_DEVICE(dev);
 
     if (s->ctx && !s->dataplane_fenced) {
+        AioContext *ctx;
         if (blk_op_is_blocked(sd->conf.blk, BLOCK_OP_TYPE_DATAPLANE, errp)) {
+            return;
+        }
+        ctx = blk_get_aio_context(sd->conf.blk);
+        if (ctx != s->ctx && ctx != qemu_get_aio_context()) {
+            error_setg(errp, "Cannot attach a blockdev that is using "
+                       "a different iothread");
             return;
         }
         virtio_scsi_acquire(s);
@@ -821,6 +828,12 @@ static void virtio_scsi_hotunplug(HotplugHandler *hotplug_dev, DeviceState *dev,
         virtio_scsi_push_event(s, sd,
                                VIRTIO_SCSI_T_TRANSPORT_RESET,
                                VIRTIO_SCSI_EVT_RESET_REMOVED);
+        virtio_scsi_release(s);
+    }
+
+    if (s->ctx) {
+        virtio_scsi_acquire(s);
+        blk_set_aio_context(sd->conf.blk, qemu_get_aio_context());
         virtio_scsi_release(s);
     }
 
@@ -893,7 +906,7 @@ static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
     scsi_bus_new(&s->bus, sizeof(s->bus), dev,
                  &virtio_scsi_scsi_info, vdev->bus_name);
     /* override default SCSI bus hotplug-handler, with virtio-scsi's one */
-    qbus_set_hotplug_handler(BUS(&s->bus), dev, &error_abort);
+    qbus_set_hotplug_handler(BUS(&s->bus), OBJECT(dev), &error_abort);
 
     virtio_scsi_dataplane_setup(s, errp);
 }

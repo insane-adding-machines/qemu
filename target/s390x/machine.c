@@ -1,7 +1,7 @@
 /*
  * S390x machine definitions and functions
  *
- * Copyright IBM Corp. 2014
+ * Copyright IBM Corp. 2014, 2018
  *
  * Authors:
  *   Thomas Huth <thuth@linux.vnet.ibm.com>
@@ -19,6 +19,7 @@
 #include "cpu.h"
 #include "internal.h"
 #include "kvm_s390x.h"
+#include "tcg_s390x.h"
 #include "sysemu/kvm.h"
 
 static int cpu_post_load(void *opaque, int version_id)
@@ -32,6 +33,11 @@ static int cpu_post_load(void *opaque, int version_id)
     if (kvm_enabled()) {
         kvm_s390_set_cpu_state(cpu, cpu->env.cpu_state);
         return kvm_s390_vcpu_interrupt_post_load(cpu);
+    }
+
+    if (tcg_enabled()) {
+        /* Rearm the CKC timer if necessary */
+        tcg_s390_tod_updated(CPU(cpu), RUN_ON_CPU_NULL);
     }
 
     return 0;
@@ -180,7 +186,7 @@ const VMStateDescription vmstate_exval = {
 
 static bool gscb_needed(void *opaque)
 {
-    return kvm_s390_get_gs();
+    return s390_has_feat(S390_FEAT_GUARDED_STORAGE);
 }
 
 const VMStateDescription vmstate_gscb = {
@@ -192,6 +198,39 @@ const VMStateDescription vmstate_gscb = {
         VMSTATE_UINT64_ARRAY(env.gscb, S390CPU, 4),
         VMSTATE_END_OF_LIST()
         }
+};
+
+static bool bpbc_needed(void *opaque)
+{
+    return s390_has_feat(S390_FEAT_BPB);
+}
+
+const VMStateDescription vmstate_bpbc = {
+    .name = "cpu/bpbc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = bpbc_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_BOOL(env.bpbc, S390CPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool etoken_needed(void *opaque)
+{
+    return s390_has_feat(S390_FEAT_ETOKEN);
+}
+
+const VMStateDescription vmstate_etoken = {
+    .name = "cpu/etoken",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = etoken_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT64(env.etoken, S390CPU),
+        VMSTATE_UINT64(env.etoken_extension, S390CPU),
+        VMSTATE_END_OF_LIST()
+    }
 };
 
 const VMStateDescription vmstate_s390_cpu = {
@@ -228,6 +267,8 @@ const VMStateDescription vmstate_s390_cpu = {
         &vmstate_riccb,
         &vmstate_exval,
         &vmstate_gscb,
+        &vmstate_bpbc,
+        &vmstate_etoken,
         NULL
     },
 };

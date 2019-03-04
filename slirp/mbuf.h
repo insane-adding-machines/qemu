@@ -33,8 +33,6 @@
 #ifndef MBUF_H
 #define MBUF_H
 
-#define MINCSIZE 4096	/* Amount to increase mbuf if too small */
-
 /*
  * Macros for type conversion
  * mtod(m,t) -	convert mbuf pointer to data pointer of correct type
@@ -50,6 +48,19 @@
  */
 
 /*
+ * mbufs allow to have a gap between the start of the allocated buffer (m_ext if
+ * M_EXT is set, m_dat otherwise) and the in-use data:
+ *
+ *  |--gapsize----->|---m_len------->
+ *  |----------m_size------------------------------>
+ *                  |----M_ROOM-------------------->
+ *                                   |-M_FREEROOM-->
+ *
+ *  ^               ^                               ^
+ *  m_dat/m_ext     m_data                          end of buffer
+ */
+
+/*
  * How much room is in the mbuf, from m_data to the end of the mbuf
  */
 #define M_ROOM(m) ((m->m_flags & M_EXT)? \
@@ -61,7 +72,6 @@
  * How much free room there is
  */
 #define M_FREEROOM(m) (M_ROOM(m) - (m)->m_len)
-#define M_TRAILINGSPACE M_FREEROOM
 
 struct mbuf {
 	/* XXX should union some of these! */
@@ -72,11 +82,11 @@ struct mbuf {
 	struct	mbuf *m_prevpkt;	/* Flags aren't used in the output queue */
 	int	m_flags;		/* Misc flags */
 
-	int	m_size;			/* Size of data */
+	int	m_size;			/* Size of mbuf, from m_dat or m_ext */
 	struct	socket *m_so;
 
-	caddr_t	m_data;			/* Location of data */
-	int	m_len;			/* Amount of data in this mbuf */
+	char *m_data;			/* Current location of data */
+	int	m_len;			/* Amount of data in this mbuf, from m_data */
 
 	Slirp *slirp;
 	bool	resolution_requested;

@@ -21,10 +21,13 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "hw/hw.h"
 #include "hw/i386/pc.h"
 #include "hw/char/serial.h"
+#include "hw/char/parallel.h"
 #include "hw/i386/apic.h"
 #include "hw/i386/topology.h"
 #include "sysemu/cpus.h"
@@ -34,12 +37,14 @@
 #include "hw/pci/pci_bus.h"
 #include "hw/nvram/fw_cfg.h"
 #include "hw/timer/hpet.h"
-#include "hw/smbios/smbios.h"
+#include "hw/firmware/smbios.h"
 #include "hw/loader.h"
 #include "elf.h"
 #include "multiboot.h"
 #include "hw/timer/mc146818rtc.h"
+#include "hw/dma/i8257.h"
 #include "hw/timer/i8254.h"
+#include "hw/input/i8042.h"
 #include "hw/audio/pcspk.h"
 #include "hw/pci/msi.h"
 #include "hw/sysbus.h"
@@ -49,8 +54,7 @@
 #include "sysemu/qtest.h"
 #include "kvm_i386.h"
 #include "hw/xen/xen.h"
-#include "sysemu/block-backend.h"
-#include "hw/block/block.h"
+#include "hw/xen/start_info.h"
 #include "ui/qemu-spice.h"
 #include "exec/memory.h"
 #include "exec/address-spaces.h"
@@ -58,17 +62,21 @@
 #include "qemu/bitmap.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
+#include "qemu/option.h"
 #include "hw/acpi/acpi.h"
 #include "hw/acpi/cpu_hotplug.h"
 #include "hw/boards.h"
-#include "hw/pci/pci_host.h"
 #include "acpi-build.h"
 #include "hw/mem/pc-dimm.h"
+#include "qapi/error.h"
+#include "qapi/qapi-visit-common.h"
 #include "qapi/visitor.h"
-#include "qapi-visit.h"
 #include "qom/cpu.h"
 #include "hw/nmi.h"
+#include "hw/usb.h"
 #include "hw/i386/intel_iommu.h"
+#include "hw/net/ne2000-isa.h"
+#include "standard-headers/asm-x86/bootparam.h"
 
 /* debug PC/ISA interrupts */
 //#define DEBUG_IRQ
@@ -103,6 +111,243 @@ static struct e820_table e820_reserve;
 static struct e820_entry *e820_table;
 static unsigned e820_entries;
 struct hpet_fw_config hpet_cfg = {.count = UINT8_MAX};
+
+/* Physical Address of PVH entry point read from kernel ELF NOTE */
+static size_t pvh_start_addr;
+
+GlobalProperty pc_compat_3_1[] = {
+    { "intel-iommu", "dma-drain", "off" },
+    { "Opteron_G3" "-" TYPE_X86_CPU, "rdtscp", "off" },
+    { "Opteron_G4" "-" TYPE_X86_CPU, "rdtscp", "off" },
+    { "Opteron_G4" "-" TYPE_X86_CPU, "npt", "off" },
+    { "Opteron_G4" "-" TYPE_X86_CPU, "nrip-save", "off" },
+    { "Opteron_G5" "-" TYPE_X86_CPU, "rdtscp", "off" },
+    { "Opteron_G5" "-" TYPE_X86_CPU, "npt", "off" },
+    { "Opteron_G5" "-" TYPE_X86_CPU, "nrip-save", "off" },
+    { "EPYC" "-" TYPE_X86_CPU, "npt", "off" },
+    { "EPYC" "-" TYPE_X86_CPU, "nrip-save", "off" },
+    { "EPYC-IBPB" "-" TYPE_X86_CPU, "npt", "off" },
+    { "EPYC-IBPB" "-" TYPE_X86_CPU, "nrip-save", "off" },
+    { "Skylake-Client" "-" TYPE_X86_CPU,      "mpx", "on" },
+    { "Skylake-Client-IBRS" "-" TYPE_X86_CPU, "mpx", "on" },
+    { "Skylake-Server" "-" TYPE_X86_CPU,      "mpx", "on" },
+    { "Skylake-Server-IBRS" "-" TYPE_X86_CPU, "mpx", "on" },
+    { "Cascadelake-Server" "-" TYPE_X86_CPU,  "mpx", "on" },
+    { "Icelake-Client" "-" TYPE_X86_CPU,      "mpx", "on" },
+    { "Icelake-Server" "-" TYPE_X86_CPU,      "mpx", "on" },
+    { "Cascadelake-Server" "-" TYPE_X86_CPU, "stepping", "5" },
+};
+const size_t pc_compat_3_1_len = G_N_ELEMENTS(pc_compat_3_1);
+
+GlobalProperty pc_compat_3_0[] = {
+    { TYPE_X86_CPU, "x-hv-synic-kvm-only", "on" },
+    { "Skylake-Server" "-" TYPE_X86_CPU, "pku", "off" },
+    { "Skylake-Server-IBRS" "-" TYPE_X86_CPU, "pku", "off" },
+};
+const size_t pc_compat_3_0_len = G_N_ELEMENTS(pc_compat_3_0);
+
+GlobalProperty pc_compat_2_12[] = {
+    { TYPE_X86_CPU, "legacy-cache", "on" },
+    { TYPE_X86_CPU, "topoext", "off" },
+    { "EPYC-" TYPE_X86_CPU, "xlevel", "0x8000000a" },
+    { "EPYC-IBPB-" TYPE_X86_CPU, "xlevel", "0x8000000a" },
+};
+const size_t pc_compat_2_12_len = G_N_ELEMENTS(pc_compat_2_12);
+
+GlobalProperty pc_compat_2_11[] = {
+    { TYPE_X86_CPU, "x-migrate-smi-count", "off" },
+    { "Skylake-Server" "-" TYPE_X86_CPU, "clflushopt", "off" },
+};
+const size_t pc_compat_2_11_len = G_N_ELEMENTS(pc_compat_2_11);
+
+GlobalProperty pc_compat_2_10[] = {
+    { TYPE_X86_CPU, "x-hv-max-vps", "0x40" },
+    { "i440FX-pcihost", "x-pci-hole64-fix", "off" },
+    { "q35-pcihost", "x-pci-hole64-fix", "off" },
+};
+const size_t pc_compat_2_10_len = G_N_ELEMENTS(pc_compat_2_10);
+
+GlobalProperty pc_compat_2_9[] = {
+    { "mch", "extended-tseg-mbytes", "0" },
+};
+const size_t pc_compat_2_9_len = G_N_ELEMENTS(pc_compat_2_9);
+
+GlobalProperty pc_compat_2_8[] = {
+    { TYPE_X86_CPU, "tcg-cpuid", "off" },
+    { "kvmclock", "x-mach-use-reliable-get-clock", "off" },
+    { "ICH9-LPC", "x-smi-broadcast", "off" },
+    { TYPE_X86_CPU, "vmware-cpuid-freq", "off" },
+    { "Haswell-" TYPE_X86_CPU, "stepping", "1" },
+};
+const size_t pc_compat_2_8_len = G_N_ELEMENTS(pc_compat_2_8);
+
+GlobalProperty pc_compat_2_7[] = {
+    { TYPE_X86_CPU, "l3-cache", "off" },
+    { TYPE_X86_CPU, "full-cpuid-auto-level", "off" },
+    { "Opteron_G3" "-" TYPE_X86_CPU, "family", "15" },
+    { "Opteron_G3" "-" TYPE_X86_CPU, "model", "6" },
+    { "Opteron_G3" "-" TYPE_X86_CPU, "stepping", "1" },
+    { "isa-pcspk", "migrate", "off" },
+};
+const size_t pc_compat_2_7_len = G_N_ELEMENTS(pc_compat_2_7);
+
+GlobalProperty pc_compat_2_6[] = {
+    { TYPE_X86_CPU, "cpuid-0xb", "off" },
+    { "vmxnet3", "romfile", "" },
+    { TYPE_X86_CPU, "fill-mtrr-mask", "off" },
+    { "apic-common", "legacy-instance-id", "on", }
+};
+const size_t pc_compat_2_6_len = G_N_ELEMENTS(pc_compat_2_6);
+
+GlobalProperty pc_compat_2_5[] = {};
+const size_t pc_compat_2_5_len = G_N_ELEMENTS(pc_compat_2_5);
+
+GlobalProperty pc_compat_2_4[] = {
+    PC_CPU_MODEL_IDS("2.4.0")
+    { "Haswell-" TYPE_X86_CPU, "abm", "off" },
+    { "Haswell-noTSX-" TYPE_X86_CPU, "abm", "off" },
+    { "Broadwell-" TYPE_X86_CPU, "abm", "off" },
+    { "Broadwell-noTSX-" TYPE_X86_CPU, "abm", "off" },
+    { "host" "-" TYPE_X86_CPU, "host-cache-info", "on" },
+    { TYPE_X86_CPU, "check", "off" },
+    { "qemu64" "-" TYPE_X86_CPU, "sse4a", "on" },
+    { "qemu64" "-" TYPE_X86_CPU, "abm", "on" },
+    { "qemu64" "-" TYPE_X86_CPU, "popcnt", "on" },
+    { "qemu32" "-" TYPE_X86_CPU, "popcnt", "on" },
+    { "Opteron_G2" "-" TYPE_X86_CPU, "rdtscp", "on" },
+    { "Opteron_G3" "-" TYPE_X86_CPU, "rdtscp", "on" },
+    { "Opteron_G4" "-" TYPE_X86_CPU, "rdtscp", "on" },
+    { "Opteron_G5" "-" TYPE_X86_CPU, "rdtscp", "on", }
+};
+const size_t pc_compat_2_4_len = G_N_ELEMENTS(pc_compat_2_4);
+
+GlobalProperty pc_compat_2_3[] = {
+    PC_CPU_MODEL_IDS("2.3.0")
+    { TYPE_X86_CPU, "arat", "off" },
+    { "qemu64" "-" TYPE_X86_CPU, "min-level", "4" },
+    { "kvm64" "-" TYPE_X86_CPU, "min-level", "5" },
+    { "pentium3" "-" TYPE_X86_CPU, "min-level", "2" },
+    { "n270" "-" TYPE_X86_CPU, "min-level", "5" },
+    { "Conroe" "-" TYPE_X86_CPU, "min-level", "4" },
+    { "Penryn" "-" TYPE_X86_CPU, "min-level", "4" },
+    { "Nehalem" "-" TYPE_X86_CPU, "min-level", "4" },
+    { "n270" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "Penryn" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "Conroe" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "Nehalem" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "Westmere" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "SandyBridge" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "IvyBridge" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "Haswell" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "Haswell-noTSX" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "Broadwell" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { "Broadwell-noTSX" "-" TYPE_X86_CPU, "min-xlevel", "0x8000000a" },
+    { TYPE_X86_CPU, "kvm-no-smi-migration", "on" },
+};
+const size_t pc_compat_2_3_len = G_N_ELEMENTS(pc_compat_2_3);
+
+GlobalProperty pc_compat_2_2[] = {
+    PC_CPU_MODEL_IDS("2.2.0")
+    { "kvm64" "-" TYPE_X86_CPU, "vme", "off" },
+    { "kvm32" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Conroe" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Penryn" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Nehalem" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Westmere" "-" TYPE_X86_CPU, "vme", "off" },
+    { "SandyBridge" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Haswell" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Broadwell" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Opteron_G1" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Opteron_G2" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Opteron_G3" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Opteron_G4" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Opteron_G5" "-" TYPE_X86_CPU, "vme", "off" },
+    { "Haswell" "-" TYPE_X86_CPU, "f16c", "off" },
+    { "Haswell" "-" TYPE_X86_CPU, "rdrand", "off" },
+    { "Broadwell" "-" TYPE_X86_CPU, "f16c", "off" },
+    { "Broadwell" "-" TYPE_X86_CPU, "rdrand", "off" },
+};
+const size_t pc_compat_2_2_len = G_N_ELEMENTS(pc_compat_2_2);
+
+GlobalProperty pc_compat_2_1[] = {
+    PC_CPU_MODEL_IDS("2.1.0")
+    { "coreduo" "-" TYPE_X86_CPU, "vmx", "on" },
+    { "core2duo" "-" TYPE_X86_CPU, "vmx", "on" },
+};
+const size_t pc_compat_2_1_len = G_N_ELEMENTS(pc_compat_2_1);
+
+GlobalProperty pc_compat_2_0[] = {
+    PC_CPU_MODEL_IDS("2.0.0")
+    { "virtio-scsi-pci", "any_layout", "off" },
+    { "PIIX4_PM", "memory-hotplug-support", "off" },
+    { "apic", "version", "0x11" },
+    { "nec-usb-xhci", "superspeed-ports-first", "off" },
+    { "nec-usb-xhci", "force-pcie-endcap", "on" },
+    { "pci-serial", "prog_if", "0" },
+    { "pci-serial-2x", "prog_if", "0" },
+    { "pci-serial-4x", "prog_if", "0" },
+    { "virtio-net-pci", "guest_announce", "off" },
+    { "ICH9-LPC", "memory-hotplug-support", "off" },
+    { "xio3130-downstream", COMPAT_PROP_PCP, "off" },
+    { "ioh3420", COMPAT_PROP_PCP, "off" },
+};
+const size_t pc_compat_2_0_len = G_N_ELEMENTS(pc_compat_2_0);
+
+GlobalProperty pc_compat_1_7[] = {
+    PC_CPU_MODEL_IDS("1.7.0")
+    { TYPE_USB_DEVICE, "msos-desc", "no" },
+    { "PIIX4_PM", "acpi-pci-hotplug-with-bridge-support", "off" },
+    { "hpet", HPET_INTCAP, "4" },
+};
+const size_t pc_compat_1_7_len = G_N_ELEMENTS(pc_compat_1_7);
+
+GlobalProperty pc_compat_1_6[] = {
+    PC_CPU_MODEL_IDS("1.6.0")
+    { "e1000", "mitigation", "off" },
+    { "qemu64-" TYPE_X86_CPU, "model", "2" },
+    { "qemu32-" TYPE_X86_CPU, "model", "3" },
+    { "i440FX-pcihost", "short_root_bus", "1" },
+    { "q35-pcihost", "short_root_bus", "1" },
+};
+const size_t pc_compat_1_6_len = G_N_ELEMENTS(pc_compat_1_6);
+
+GlobalProperty pc_compat_1_5[] = {
+    PC_CPU_MODEL_IDS("1.5.0")
+    { "Conroe-" TYPE_X86_CPU, "model", "2" },
+    { "Conroe-" TYPE_X86_CPU, "min-level", "2" },
+    { "Penryn-" TYPE_X86_CPU, "model", "2" },
+    { "Penryn-" TYPE_X86_CPU, "min-level", "2" },
+    { "Nehalem-" TYPE_X86_CPU, "model", "2" },
+    { "Nehalem-" TYPE_X86_CPU, "min-level", "2" },
+    { "virtio-net-pci", "any_layout", "off" },
+    { TYPE_X86_CPU, "pmu", "on" },
+    { "i440FX-pcihost", "short_root_bus", "0" },
+    { "q35-pcihost", "short_root_bus", "0" },
+};
+const size_t pc_compat_1_5_len = G_N_ELEMENTS(pc_compat_1_5);
+
+GlobalProperty pc_compat_1_4[] = {
+    PC_CPU_MODEL_IDS("1.4.0")
+    { "scsi-hd", "discard_granularity", "0" },
+    { "scsi-cd", "discard_granularity", "0" },
+    { "scsi-disk", "discard_granularity", "0" },
+    { "ide-hd", "discard_granularity", "0" },
+    { "ide-cd", "discard_granularity", "0" },
+    { "ide-drive", "discard_granularity", "0" },
+    { "virtio-blk-pci", "discard_granularity", "0" },
+    /* DEV_NVECTORS_UNSPECIFIED as a uint32_t string: */
+    { "virtio-serial-pci", "vectors", "0xFFFFFFFF" },
+    { "virtio-net-pci", "ctrl_guest_offloads", "off" },
+    { "e1000", "romfile", "pxe-e1000.rom" },
+    { "ne2k_pci", "romfile", "pxe-ne2k_pci.rom" },
+    { "pcnet", "romfile", "pxe-pcnet.rom" },
+    { "rtl8139", "romfile", "pxe-rtl8139.rom" },
+    { "virtio-net-pci", "romfile", "pxe-virtio.rom" },
+    { "486-" TYPE_X86_CPU, "model", "0" },
+    { "n270" "-" TYPE_X86_CPU, "movbe", "off" },
+    { "Westmere" "-" TYPE_X86_CPU, "pclmulqdq", "off" },
+};
+const size_t pc_compat_1_4_len = G_N_ELEMENTS(pc_compat_1_4);
 
 void gsi_handler(void *opaque, int n, int level)
 {
@@ -444,12 +689,12 @@ void pc_cmos_init(PCMachineState *pcms,
 
     /* memory size */
     /* base memory (first MiB) */
-    val = MIN(pcms->below_4g_mem_size / 1024, 640);
+    val = MIN(pcms->below_4g_mem_size / KiB, 640);
     rtc_set_memory(s, 0x15, val);
     rtc_set_memory(s, 0x16, val >> 8);
     /* extended memory (next 64MiB) */
-    if (pcms->below_4g_mem_size > 1024 * 1024) {
-        val = (pcms->below_4g_mem_size - 1024 * 1024) / 1024;
+    if (pcms->below_4g_mem_size > 1 * MiB) {
+        val = (pcms->below_4g_mem_size - 1 * MiB) / KiB;
     } else {
         val = 0;
     }
@@ -460,8 +705,8 @@ void pc_cmos_init(PCMachineState *pcms,
     rtc_set_memory(s, 0x30, val);
     rtc_set_memory(s, 0x31, val >> 8);
     /* memory between 16MiB and 4GiB */
-    if (pcms->below_4g_mem_size > 16 * 1024 * 1024) {
-        val = (pcms->below_4g_mem_size - 16 * 1024 * 1024) / 65536;
+    if (pcms->below_4g_mem_size > 16 * MiB) {
+        val = (pcms->below_4g_mem_size - 16 * MiB) / (64 * KiB);
     } else {
         val = 0;
     }
@@ -479,7 +724,7 @@ void pc_cmos_init(PCMachineState *pcms,
                              TYPE_ISA_DEVICE,
                              (Object **)&pcms->rtc,
                              object_property_allow_set_link,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE, &error_abort);
+                             OBJ_PROP_LINK_STRONG, &error_abort);
     object_property_set_link(OBJECT(pcms), OBJECT(s),
                              "rtc_state", &error_abort);
 
@@ -815,13 +1060,6 @@ static long get_file_size(FILE *f)
     return size;
 }
 
-/* setup_data types */
-#define SETUP_NONE     0
-#define SETUP_E820_EXT 1
-#define SETUP_DTB      2
-#define SETUP_PCI      3
-#define SETUP_EFI      4
-
 struct setup_data {
     uint64_t next;
     uint32_t type;
@@ -829,14 +1067,117 @@ struct setup_data {
     uint8_t data[0];
 } __attribute__((packed));
 
+
+/*
+ * The entry point into the kernel for PVH boot is different from
+ * the native entry point.  The PVH entry is defined by the x86/HVM
+ * direct boot ABI and is available in an ELFNOTE in the kernel binary.
+ *
+ * This function is passed to load_elf() when it is called from
+ * load_elfboot() which then additionally checks for an ELF Note of
+ * type XEN_ELFNOTE_PHYS32_ENTRY and passes it to this function to
+ * parse the PVH entry address from the ELF Note.
+ *
+ * Due to trickery in elf_opts.h, load_elf() is actually available as
+ * load_elf32() or load_elf64() and this routine needs to be able
+ * to deal with being called as 32 or 64 bit.
+ *
+ * The address of the PVH entry point is saved to the 'pvh_start_addr'
+ * global variable.  (although the entry point is 32-bit, the kernel
+ * binary can be either 32-bit or 64-bit).
+ */
+static uint64_t read_pvh_start_addr(void *arg1, void *arg2, bool is64)
+{
+    size_t *elf_note_data_addr;
+
+    /* Check if ELF Note header passed in is valid */
+    if (arg1 == NULL) {
+        return 0;
+    }
+
+    if (is64) {
+        struct elf64_note *nhdr64 = (struct elf64_note *)arg1;
+        uint64_t nhdr_size64 = sizeof(struct elf64_note);
+        uint64_t phdr_align = *(uint64_t *)arg2;
+        uint64_t nhdr_namesz = nhdr64->n_namesz;
+
+        elf_note_data_addr =
+            ((void *)nhdr64) + nhdr_size64 +
+            QEMU_ALIGN_UP(nhdr_namesz, phdr_align);
+    } else {
+        struct elf32_note *nhdr32 = (struct elf32_note *)arg1;
+        uint32_t nhdr_size32 = sizeof(struct elf32_note);
+        uint32_t phdr_align = *(uint32_t *)arg2;
+        uint32_t nhdr_namesz = nhdr32->n_namesz;
+
+        elf_note_data_addr =
+            ((void *)nhdr32) + nhdr_size32 +
+            QEMU_ALIGN_UP(nhdr_namesz, phdr_align);
+    }
+
+    pvh_start_addr = *elf_note_data_addr;
+
+    return pvh_start_addr;
+}
+
+static bool load_elfboot(const char *kernel_filename,
+                   int kernel_file_size,
+                   uint8_t *header,
+                   size_t pvh_xen_start_addr,
+                   FWCfgState *fw_cfg)
+{
+    uint32_t flags = 0;
+    uint32_t mh_load_addr = 0;
+    uint32_t elf_kernel_size = 0;
+    uint64_t elf_entry;
+    uint64_t elf_low, elf_high;
+    int kernel_size;
+
+    if (ldl_p(header) != 0x464c457f) {
+        return false; /* no elfboot */
+    }
+
+    bool elf_is64 = header[EI_CLASS] == ELFCLASS64;
+    flags = elf_is64 ?
+        ((Elf64_Ehdr *)header)->e_flags : ((Elf32_Ehdr *)header)->e_flags;
+
+    if (flags & 0x00010004) { /* LOAD_ELF_HEADER_HAS_ADDR */
+        error_report("elfboot unsupported flags = %x", flags);
+        exit(1);
+    }
+
+    uint64_t elf_note_type = XEN_ELFNOTE_PHYS32_ENTRY;
+    kernel_size = load_elf(kernel_filename, read_pvh_start_addr,
+                           NULL, &elf_note_type, &elf_entry,
+                           &elf_low, &elf_high, 0, I386_ELF_MACHINE,
+                           0, 0);
+
+    if (kernel_size < 0) {
+        error_report("Error while loading elf kernel");
+        exit(1);
+    }
+    mh_load_addr = elf_low;
+    elf_kernel_size = elf_high - elf_low;
+
+    if (pvh_start_addr == 0) {
+        error_report("Error loading uncompressed kernel without PVH ELF Note");
+        exit(1);
+    }
+    fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ENTRY, pvh_start_addr);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ADDR, mh_load_addr);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_SIZE, elf_kernel_size);
+
+    return true;
+}
+
 static void load_linux(PCMachineState *pcms,
                        FWCfgState *fw_cfg)
 {
     uint16_t protocol;
-    int setup_size, kernel_size, initrd_size = 0, cmdline_size;
+    int setup_size, kernel_size, cmdline_size;
     int dtb_size, setup_data_offset;
     uint32_t initrd_max;
-    uint8_t header[8192], *setup, *kernel, *initrd_data;
+    uint8_t header[8192], *setup, *kernel;
     hwaddr real_addr, prot_addr, cmdline_addr, initrd_addr = 0;
     FILE *f;
     char *vmode;
@@ -868,6 +1209,59 @@ static void load_linux(PCMachineState *pcms,
     if (ldl_p(header+0x202) == 0x53726448) {
         protocol = lduw_p(header+0x206);
     } else {
+        /*
+         * Check if the file is an uncompressed kernel file (ELF) and load it,
+         * saving the PVH entry point used by the x86/HVM direct boot ABI.
+         * If load_elfboot() is successful, populate the fw_cfg info.
+         */
+        if (pcmc->pvh_enabled &&
+            load_elfboot(kernel_filename, kernel_size,
+                         header, pvh_start_addr, fw_cfg)) {
+            fclose(f);
+
+            fw_cfg_add_i32(fw_cfg, FW_CFG_CMDLINE_SIZE,
+                strlen(kernel_cmdline) + 1);
+            fw_cfg_add_string(fw_cfg, FW_CFG_CMDLINE_DATA, kernel_cmdline);
+
+            fw_cfg_add_i32(fw_cfg, FW_CFG_SETUP_SIZE, sizeof(header));
+            fw_cfg_add_bytes(fw_cfg, FW_CFG_SETUP_DATA,
+                             header, sizeof(header));
+
+            /* load initrd */
+            if (initrd_filename) {
+                gsize initrd_size;
+                gchar *initrd_data;
+                GError *gerr = NULL;
+
+                if (!g_file_get_contents(initrd_filename, &initrd_data,
+                            &initrd_size, &gerr)) {
+                    fprintf(stderr, "qemu: error reading initrd %s: %s\n",
+                            initrd_filename, gerr->message);
+                    exit(1);
+                }
+
+                initrd_max = pcms->below_4g_mem_size - pcmc->acpi_data_size - 1;
+                if (initrd_size >= initrd_max) {
+                    fprintf(stderr, "qemu: initrd is too large, cannot support."
+                            "(max: %"PRIu32", need %"PRId64")\n",
+                            initrd_max, (uint64_t)initrd_size);
+                    exit(1);
+                }
+
+                initrd_addr = (initrd_max - initrd_size) & ~4095;
+
+                fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_ADDR, initrd_addr);
+                fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_SIZE, initrd_size);
+                fw_cfg_add_bytes(fw_cfg, FW_CFG_INITRD_DATA, initrd_data,
+                                 initrd_size);
+            }
+
+            option_rom[nb_option_roms].bootindex = 0;
+            option_rom[nb_option_roms].name = "pvh.bin";
+            nb_option_roms++;
+
+            return;
+        }
         /* This looks like a multiboot kernel. If it is, let's stop
            treating it like a Linux kernel. */
         if (load_multiboot(fw_cfg, f, kernel_filename, initrd_filename,
@@ -905,7 +1299,26 @@ static void load_linux(PCMachineState *pcms,
 #endif
 
     /* highest address for loading the initrd */
-    if (protocol >= 0x203) {
+    if (protocol >= 0x20c &&
+        lduw_p(header+0x236) & XLF_CAN_BE_LOADED_ABOVE_4G) {
+        /*
+         * Linux has supported initrd up to 4 GB for a very long time (2007,
+         * long before XLF_CAN_BE_LOADED_ABOVE_4G which was added in 2013),
+         * though it only sets initrd_max to 2 GB to "work around bootloader
+         * bugs". Luckily, QEMU firmware(which does something like bootloader)
+         * has supported this.
+         *
+         * It's believed that if XLF_CAN_BE_LOADED_ABOVE_4G is set, initrd can
+         * be loaded into any address.
+         *
+         * In addition, initrd_max is uint32_t simply because QEMU doesn't
+         * support the 64-bit boot protocol (specifically the ext_ramdisk_image
+         * field).
+         *
+         * Therefore here just limit initrd_max to UINT32_MAX simply as well.
+         */
+        initrd_max = UINT32_MAX;
+    } else if (protocol >= 0x203) {
         initrd_max = ldl_p(header+0x22c);
     } else {
         initrd_max = 0x37ffffff;
@@ -959,22 +1372,29 @@ static void load_linux(PCMachineState *pcms,
 
     /* load initrd */
     if (initrd_filename) {
+        gsize initrd_size;
+        gchar *initrd_data;
+        GError *gerr = NULL;
+
         if (protocol < 0x200) {
             fprintf(stderr, "qemu: linux kernel too old to load a ram disk\n");
             exit(1);
         }
 
-        initrd_size = get_image_size(initrd_filename);
-        if (initrd_size < 0) {
+        if (!g_file_get_contents(initrd_filename, &initrd_data,
+                                 &initrd_size, &gerr)) {
             fprintf(stderr, "qemu: error reading initrd %s: %s\n",
-                    initrd_filename, strerror(errno));
+                    initrd_filename, gerr->message);
+            exit(1);
+        }
+        if (initrd_size >= initrd_max) {
+            fprintf(stderr, "qemu: initrd is too large, cannot support."
+                    "(max: %"PRIu32", need %"PRId64")\n",
+                    initrd_max, (uint64_t)initrd_size);
             exit(1);
         }
 
         initrd_addr = (initrd_max-initrd_size) & ~4095;
-
-        initrd_data = g_malloc(initrd_size);
-        load_image(initrd_filename, initrd_data);
 
         fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_ADDR, initrd_addr);
         fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_SIZE, initrd_size);
@@ -1147,7 +1567,8 @@ void pc_cpus_init(PCMachineState *pcms)
     pcms->apic_id_limit = x86_cpu_apic_id_from_index(max_cpus - 1) + 1;
     possible_cpus = mc->possible_cpu_arch_ids(ms);
     for (i = 0; i < smp_cpus; i++) {
-        pc_new_cpu(ms->cpu_type, possible_cpus->cpus[i].arch_id, &error_fatal);
+        pc_new_cpu(possible_cpus->cpus[i].type, possible_cpus->cpus[i].arch_id,
+                   &error_fatal);
     }
 }
 
@@ -1228,10 +1649,10 @@ void pc_machine_done(Notifier *notifier, void *data)
         fw_cfg_modify_i16(pcms->fw_cfg, FW_CFG_NB_CPUS, pcms->boot_cpus);
     }
 
-    if (pcms->apic_id_limit > 255) {
+    if (pcms->apic_id_limit > 255 && !xen_enabled()) {
         IntelIOMMUState *iommu = INTEL_IOMMU_DEVICE(x86_iommu_get_default());
 
-        if (!iommu || !iommu->x86_iommu.intr_supported ||
+        if (!iommu || !x86_iommu_ir_supported(X86_IOMMU_DEVICE(iommu)) ||
             iommu->intr_eim != ON_OFF_AUTO_ON) {
             error_report("current -smp configuration requires "
                          "Extended Interrupt Mode enabled. "
@@ -1309,6 +1730,7 @@ void xen_load_linux(PCMachineState *pcms)
     for (i = 0; i < nb_option_roms; i++) {
         assert(!strcmp(option_rom[i].name, "linuxboot.bin") ||
                !strcmp(option_rom[i].name, "linuxboot_dma.bin") ||
+               !strcmp(option_rom[i].name, "pvh.bin") ||
                !strcmp(option_rom[i].name, "multiboot.bin"));
         rom_add_option(option_rom[i].name, option_rom[i].bootindex);
     }
@@ -1365,11 +1787,13 @@ void pc_memory_init(PCMachineState *pcms,
         exit(EXIT_FAILURE);
     }
 
-    /* initialize hotplug memory address space */
+    /* always allocate the device memory information */
+    machine->device_memory = g_malloc0(sizeof(*machine->device_memory));
+
+    /* initialize device memory address space */
     if (pcmc->has_reserved_memory &&
         (machine->ram_size < machine->maxram_size)) {
-        ram_addr_t hotplug_mem_size =
-            machine->maxram_size - machine->ram_size;
+        ram_addr_t device_mem_size = machine->maxram_size - machine->ram_size;
 
         if (machine->ram_slots > ACPI_MAX_RAM_SLOTS) {
             error_report("unsupported amount of memory slots: %"PRIu64,
@@ -1384,25 +1808,25 @@ void pc_memory_init(PCMachineState *pcms,
             exit(EXIT_FAILURE);
         }
 
-        pcms->hotplug_memory.base =
-            ROUND_UP(0x100000000ULL + pcms->above_4g_mem_size, 1ULL << 30);
+        machine->device_memory->base =
+            ROUND_UP(0x100000000ULL + pcms->above_4g_mem_size, 1 * GiB);
 
         if (pcmc->enforce_aligned_dimm) {
-            /* size hotplug region assuming 1G page max alignment per slot */
-            hotplug_mem_size += (1ULL << 30) * machine->ram_slots;
+            /* size device region assuming 1G page max alignment per slot */
+            device_mem_size += (1 * GiB) * machine->ram_slots;
         }
 
-        if ((pcms->hotplug_memory.base + hotplug_mem_size) <
-            hotplug_mem_size) {
+        if ((machine->device_memory->base + device_mem_size) <
+            device_mem_size) {
             error_report("unsupported amount of maximum memory: " RAM_ADDR_FMT,
                          machine->maxram_size);
             exit(EXIT_FAILURE);
         }
 
-        memory_region_init(&pcms->hotplug_memory.mr, OBJECT(pcms),
-                           "hotplug-memory", hotplug_mem_size);
-        memory_region_add_subregion(system_memory, pcms->hotplug_memory.base,
-                                    &pcms->hotplug_memory.mr);
+        memory_region_init(&machine->device_memory->mr, OBJECT(pcms),
+                           "device-memory", device_mem_size);
+        memory_region_add_subregion(system_memory, machine->device_memory->base,
+                                    &machine->device_memory->mr);
     }
 
     /* Initialize PC system firmware */
@@ -1423,15 +1847,15 @@ void pc_memory_init(PCMachineState *pcms,
 
     rom_set_fw(fw_cfg);
 
-    if (pcmc->has_reserved_memory && pcms->hotplug_memory.base) {
+    if (pcmc->has_reserved_memory && machine->device_memory->base) {
         uint64_t *val = g_malloc(sizeof(*val));
         PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
-        uint64_t res_mem_end = pcms->hotplug_memory.base;
+        uint64_t res_mem_end = machine->device_memory->base;
 
         if (!pcmc->broken_reserved_end) {
-            res_mem_end += memory_region_size(&pcms->hotplug_memory.mr);
+            res_mem_end += memory_region_size(&machine->device_memory->mr);
         }
-        *val = cpu_to_le64(ROUND_UP(res_mem_end, 0x1ULL << 30));
+        *val = cpu_to_le64(ROUND_UP(res_mem_end, 1 * GiB));
         fw_cfg_add_file(fw_cfg, "etc/reserved-memory-end", val, sizeof(*val));
     }
 
@@ -1446,6 +1870,29 @@ void pc_memory_init(PCMachineState *pcms,
 
     /* Init default IOAPIC address space */
     pcms->ioapic_as = &address_space_memory;
+}
+
+/*
+ * The 64bit pci hole starts after "above 4G RAM" and
+ * potentially the space reserved for memory hotplug.
+ */
+uint64_t pc_pci_hole64_start(void)
+{
+    PCMachineState *pcms = PC_MACHINE(qdev_get_machine());
+    PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
+    MachineState *ms = MACHINE(pcms);
+    uint64_t hole64_start = 0;
+
+    if (pcmc->has_reserved_memory && ms->device_memory->base) {
+        hole64_start = ms->device_memory->base;
+        if (!pcmc->broken_reserved_end) {
+            hole64_start += memory_region_size(&ms->device_memory->mr);
+        }
+    } else {
+        hole64_start = 0x100000000ULL + pcms->above_4g_mem_size;
+    }
+
+    return ROUND_UP(hole64_start, 1 * GiB);
 }
 
 qemu_irq pc_allocate_cpu_irq(void)
@@ -1489,6 +1936,44 @@ static const MemoryRegionOps ioportF0_io_ops = {
     },
 };
 
+static void pc_superio_init(ISABus *isa_bus, bool create_fdctrl, bool no_vmport)
+{
+    int i;
+    DriveInfo *fd[MAX_FD];
+    qemu_irq *a20_line;
+    ISADevice *i8042, *port92, *vmmouse;
+
+    serial_hds_isa_init(isa_bus, 0, MAX_ISA_SERIAL_PORTS);
+    parallel_hds_isa_init(isa_bus, MAX_PARALLEL_PORTS);
+
+    for (i = 0; i < MAX_FD; i++) {
+        fd[i] = drive_get(IF_FLOPPY, 0, i);
+        create_fdctrl |= !!fd[i];
+    }
+    if (create_fdctrl) {
+        fdctrl_init_isa(isa_bus, fd);
+    }
+
+    i8042 = isa_create_simple(isa_bus, "i8042");
+    if (!no_vmport) {
+        vmport_init(isa_bus);
+        vmmouse = isa_try_create(isa_bus, "vmmouse");
+    } else {
+        vmmouse = NULL;
+    }
+    if (vmmouse) {
+        DeviceState *dev = DEVICE(vmmouse);
+        qdev_prop_set_ptr(dev, "ps2_mouse", i8042);
+        qdev_init_nofail(dev);
+    }
+    port92 = isa_create_simple(isa_bus, "port92");
+
+    a20_line = qemu_allocate_irqs(handle_a20_line_change, first_cpu, 2);
+    i8042_setup_a20_line(i8042, a20_line[0]);
+    port92_init(port92, a20_line[1]);
+    g_free(a20_line);
+}
+
 void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
                           ISADevice **rtc_state,
                           bool create_fdctrl,
@@ -1497,13 +1982,11 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
                           uint32_t hpet_irqs)
 {
     int i;
-    DriveInfo *fd[MAX_FD];
     DeviceState *hpet = NULL;
     int pit_isa_irq = 0;
     qemu_irq pit_alt_irq = NULL;
     qemu_irq rtc_irq = NULL;
-    qemu_irq *a20_line;
-    ISADevice *i8042, *port92, *vmmouse, *pit = NULL;
+    ISADevice *pit = NULL;
     MemoryRegion *ioport80_io = g_new(MemoryRegion, 1);
     MemoryRegion *ioportF0_io = g_new(MemoryRegion, 1);
 
@@ -1543,7 +2026,7 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
             rtc_irq = qdev_get_gpio_in(hpet, HPET_LEGACY_RTC_INT);
         }
     }
-    *rtc_state = rtc_init(isa_bus, 2000, rtc_irq);
+    *rtc_state = mc146818_rtc_init(isa_bus, 2000, rtc_irq);
 
     qemu_register_boot_set(pc_boot_set, *rtc_state);
 
@@ -1551,7 +2034,7 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
         if (kvm_pit_in_kernel()) {
             pit = kvm_pit_init(isa_bus, 0x40);
         } else {
-            pit = pit_init(isa_bus, 0x40, pit_isa_irq, pit_alt_irq);
+            pit = i8254_pit_init(isa_bus, 0x40, pit_isa_irq, pit_alt_irq);
         }
         if (hpet) {
             /* connect PIT to output control line of the HPET */
@@ -1560,70 +2043,28 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
         pcspk_init(isa_bus, pit);
     }
 
-    serial_hds_isa_init(isa_bus, 0, MAX_SERIAL_PORTS);
-    parallel_hds_isa_init(isa_bus, MAX_PARALLEL_PORTS);
+    i8257_dma_init(isa_bus, 0);
 
-    a20_line = qemu_allocate_irqs(handle_a20_line_change, first_cpu, 2);
-    i8042 = isa_create_simple(isa_bus, "i8042");
-    i8042_setup_a20_line(i8042, a20_line[0]);
-    if (!no_vmport) {
-        vmport_init(isa_bus);
-        vmmouse = isa_try_create(isa_bus, "vmmouse");
-    } else {
-        vmmouse = NULL;
-    }
-    if (vmmouse) {
-        DeviceState *dev = DEVICE(vmmouse);
-        qdev_prop_set_ptr(dev, "ps2_mouse", i8042);
-        qdev_init_nofail(dev);
-    }
-    port92 = isa_create_simple(isa_bus, "port92");
-    port92_init(port92, a20_line[1]);
-    g_free(a20_line);
-
-    DMA_init(isa_bus, 0);
-
-    for(i = 0; i < MAX_FD; i++) {
-        fd[i] = drive_get(IF_FLOPPY, 0, i);
-        create_fdctrl |= !!fd[i];
-    }
-    if (create_fdctrl) {
-        fdctrl_init_isa(isa_bus, fd);
-    }
+    /* Super I/O */
+    pc_superio_init(isa_bus, create_fdctrl, no_vmport);
 }
 
-void pc_nic_init(ISABus *isa_bus, PCIBus *pci_bus)
+void pc_nic_init(PCMachineClass *pcmc, ISABus *isa_bus, PCIBus *pci_bus)
 {
     int i;
 
     rom_set_order_override(FW_CFG_ORDER_OVERRIDE_NIC);
     for (i = 0; i < nb_nics; i++) {
         NICInfo *nd = &nd_table[i];
+        const char *model = nd->model ? nd->model : pcmc->default_nic_model;
 
-        if (!pci_bus || (nd->model && strcmp(nd->model, "ne2k_isa") == 0)) {
+        if (g_str_equal(model, "ne2k_isa")) {
             pc_init_ne2k_isa(isa_bus, nd);
         } else {
-            pci_nic_init_nofail(nd, pci_bus, "e1000", NULL);
+            pci_nic_init_nofail(nd, pci_bus, model, NULL);
         }
     }
     rom_reset_order_override();
-}
-
-void pc_pci_device_init(PCIBus *pci_bus)
-{
-    int max_bus;
-    int bus;
-
-    /* Note: if=scsi is deprecated with PC machine types */
-    max_bus = drive_get_max_bus(IF_SCSI);
-    for (bus = 0; bus <= max_bus; bus++) {
-        pci_create_simple(pci_bus, -1, "lsi53c895a");
-        /*
-         * By not creating frontends here, we make
-         * scsi_legacy_handle_cmdline() create them, and warn that
-         * this usage is deprecated.
-         */
-    }
 }
 
 void ioapic_init_gsi(GSIState *gsi_state, const char *parent_name)
@@ -1633,9 +2074,9 @@ void ioapic_init_gsi(GSIState *gsi_state, const char *parent_name)
     unsigned int i;
 
     if (kvm_ioapic_in_kernel()) {
-        dev = qdev_create(NULL, "kvm-ioapic");
+        dev = qdev_create(NULL, TYPE_KVM_IOAPIC);
     } else {
-        dev = qdev_create(NULL, "ioapic");
+        dev = qdev_create(NULL, TYPE_IOAPIC);
     }
     if (parent_name) {
         object_property_add_child(object_resolve_path(parent_name, NULL),
@@ -1650,41 +2091,42 @@ void ioapic_init_gsi(GSIState *gsi_state, const char *parent_name)
     }
 }
 
-static void pc_dimm_plug(HotplugHandler *hotplug_dev,
-                         DeviceState *dev, Error **errp)
+static void pc_memory_pre_plug(HotplugHandler *hotplug_dev, DeviceState *dev,
+                               Error **errp)
 {
-    HotplugHandlerClass *hhc;
-    Error *local_err = NULL;
-    PCMachineState *pcms = PC_MACHINE(hotplug_dev);
-    PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
-    PCDIMMDevice *dimm = PC_DIMM(dev);
-    PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
-    MemoryRegion *mr;
-    uint64_t align = TARGET_PAGE_SIZE;
-    bool is_nvdimm = object_dynamic_cast(OBJECT(dev), TYPE_NVDIMM);
+    const PCMachineState *pcms = PC_MACHINE(hotplug_dev);
+    const PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
+    const bool is_nvdimm = object_dynamic_cast(OBJECT(dev), TYPE_NVDIMM);
+    const uint64_t legacy_align = TARGET_PAGE_SIZE;
 
-    mr = ddc->get_memory_region(dimm, &local_err);
-    if (local_err) {
-        goto out;
-    }
-
-    if (memory_region_get_alignment(mr) && pcmc->enforce_aligned_dimm) {
-        align = memory_region_get_alignment(mr);
-    }
-
-    if (!pcms->acpi_dev) {
-        error_setg(&local_err,
-                   "memory hotplug is not enabled: missing acpi device");
-        goto out;
+    /*
+     * When -no-acpi is used with Q35 machine type, no ACPI is built,
+     * but pcms->acpi_dev is still created. Check !acpi_enabled in
+     * addition to cover this case.
+     */
+    if (!pcms->acpi_dev || !acpi_enabled) {
+        error_setg(errp,
+                   "memory hotplug is not enabled: missing acpi device or acpi disabled");
+        return;
     }
 
     if (is_nvdimm && !pcms->acpi_nvdimm_state.is_enabled) {
-        error_setg(&local_err,
-                   "nvdimm is not enabled: missing 'nvdimm' in '-M'");
-        goto out;
+        error_setg(errp, "nvdimm is not enabled: missing 'nvdimm' in '-M'");
+        return;
     }
 
-    pc_dimm_memory_plug(dev, &pcms->hotplug_memory, mr, align, &local_err);
+    pc_dimm_pre_plug(PC_DIMM(dev), MACHINE(hotplug_dev),
+                     pcmc->enforce_aligned_dimm ? NULL : &legacy_align, errp);
+}
+
+static void pc_memory_plug(HotplugHandler *hotplug_dev,
+                           DeviceState *dev, Error **errp)
+{
+    Error *local_err = NULL;
+    PCMachineState *pcms = PC_MACHINE(hotplug_dev);
+    bool is_nvdimm = object_dynamic_cast(OBJECT(dev), TYPE_NVDIMM);
+
+    pc_dimm_plug(PC_DIMM(dev), MACHINE(pcms), &local_err);
     if (local_err) {
         goto out;
     }
@@ -1693,22 +2135,25 @@ static void pc_dimm_plug(HotplugHandler *hotplug_dev,
         nvdimm_plug(&pcms->acpi_nvdimm_state);
     }
 
-    hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
-    hhc->plug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &error_abort);
+    hotplug_handler_plug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &error_abort);
 out:
     error_propagate(errp, local_err);
 }
 
-static void pc_dimm_unplug_request(HotplugHandler *hotplug_dev,
-                                   DeviceState *dev, Error **errp)
+static void pc_memory_unplug_request(HotplugHandler *hotplug_dev,
+                                     DeviceState *dev, Error **errp)
 {
-    HotplugHandlerClass *hhc;
     Error *local_err = NULL;
     PCMachineState *pcms = PC_MACHINE(hotplug_dev);
 
-    if (!pcms->acpi_dev) {
+    /*
+     * When -no-acpi is used with Q35 machine type, no ACPI is built,
+     * but pcms->acpi_dev is still created. Check !acpi_enabled in
+     * addition to cover this case.
+     */
+    if (!pcms->acpi_dev || !acpi_enabled) {
         error_setg(&local_err,
-                   "memory hotplug is not enabled: missing acpi device");
+                   "memory hotplug is not enabled: missing acpi device or acpi disabled");
         goto out;
     }
 
@@ -1718,36 +2163,24 @@ static void pc_dimm_unplug_request(HotplugHandler *hotplug_dev,
         goto out;
     }
 
-    hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
-    hhc->unplug_request(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
-
+    hotplug_handler_unplug_request(HOTPLUG_HANDLER(pcms->acpi_dev), dev,
+                                   &local_err);
 out:
     error_propagate(errp, local_err);
 }
 
-static void pc_dimm_unplug(HotplugHandler *hotplug_dev,
-                           DeviceState *dev, Error **errp)
+static void pc_memory_unplug(HotplugHandler *hotplug_dev,
+                             DeviceState *dev, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(hotplug_dev);
-    PCDIMMDevice *dimm = PC_DIMM(dev);
-    PCDIMMDeviceClass *ddc = PC_DIMM_GET_CLASS(dimm);
-    MemoryRegion *mr;
-    HotplugHandlerClass *hhc;
     Error *local_err = NULL;
 
-    mr = ddc->get_memory_region(dimm, &local_err);
+    hotplug_handler_unplug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
     if (local_err) {
         goto out;
     }
 
-    hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
-    hhc->unplug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
-
-    if (local_err) {
-        goto out;
-    }
-
-    pc_dimm_memory_unplug(dev, &pcms->hotplug_memory, mr);
+    pc_dimm_unplug(PC_DIMM(dev), MACHINE(pcms));
     object_unparent(OBJECT(dev));
 
  out:
@@ -1784,14 +2217,12 @@ static void pc_cpu_plug(HotplugHandler *hotplug_dev,
                         DeviceState *dev, Error **errp)
 {
     CPUArchId *found_cpu;
-    HotplugHandlerClass *hhc;
     Error *local_err = NULL;
     X86CPU *cpu = X86_CPU(dev);
     PCMachineState *pcms = PC_MACHINE(hotplug_dev);
 
     if (pcms->acpi_dev) {
-        hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
-        hhc->plug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
+        hotplug_handler_plug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
         if (local_err) {
             goto out;
         }
@@ -1815,10 +2246,14 @@ static void pc_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
                                      DeviceState *dev, Error **errp)
 {
     int idx = -1;
-    HotplugHandlerClass *hhc;
     Error *local_err = NULL;
     X86CPU *cpu = X86_CPU(dev);
     PCMachineState *pcms = PC_MACHINE(hotplug_dev);
+
+    if (!pcms->acpi_dev) {
+        error_setg(&local_err, "CPU hot unplug not supported without ACPI");
+        goto out;
+    }
 
     pc_find_cpu_slot(MACHINE(pcms), cpu->apic_id, &idx);
     assert(idx != -1);
@@ -1827,9 +2262,8 @@ static void pc_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
         goto out;
     }
 
-    hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
-    hhc->unplug_request(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
-
+    hotplug_handler_unplug_request(HOTPLUG_HANDLER(pcms->acpi_dev), dev,
+                                   &local_err);
     if (local_err) {
         goto out;
     }
@@ -1843,14 +2277,11 @@ static void pc_cpu_unplug_cb(HotplugHandler *hotplug_dev,
                              DeviceState *dev, Error **errp)
 {
     CPUArchId *found_cpu;
-    HotplugHandlerClass *hhc;
     Error *local_err = NULL;
     X86CPU *cpu = X86_CPU(dev);
     PCMachineState *pcms = PC_MACHINE(hotplug_dev);
 
-    hhc = HOTPLUG_HANDLER_GET_CLASS(pcms->acpi_dev);
-    hhc->unplug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
-
+    hotplug_handler_unplug(HOTPLUG_HANDLER(pcms->acpi_dev), dev, &local_err);
     if (local_err) {
         goto out;
     }
@@ -1876,7 +2307,14 @@ static void pc_cpu_pre_plug(HotplugHandler *hotplug_dev,
     CPUArchId *cpu_slot;
     X86CPUTopoInfo topo;
     X86CPU *cpu = X86_CPU(dev);
+    MachineState *ms = MACHINE(hotplug_dev);
     PCMachineState *pcms = PC_MACHINE(hotplug_dev);
+
+    if(!object_dynamic_cast(OBJECT(cpu), ms->cpu_type)) {
+        error_setg(errp, "Invalid CPU type, expected cpu type: '%s'",
+                   ms->cpu_type);
+        return;
+    }
 
     /* if APIC ID is not set, set it based on socket/core/thread properties */
     if (cpu->apic_id == UNASSIGNED_APIC_ID) {
@@ -1959,6 +2397,11 @@ static void pc_cpu_pre_plug(HotplugHandler *hotplug_dev,
     }
     cpu->thread_id = topo.smt_id;
 
+    if (cpu->hyperv_vpindex && !kvm_hv_vpindex_settable()) {
+        error_setg(errp, "kernel doesn't allow setting HyperV VP_INDEX");
+        return;
+    }
+
     cs = CPU(cpu);
     cs->cpu_index = idx;
 
@@ -1968,7 +2411,9 @@ static void pc_cpu_pre_plug(HotplugHandler *hotplug_dev,
 static void pc_machine_device_pre_plug_cb(HotplugHandler *hotplug_dev,
                                           DeviceState *dev, Error **errp)
 {
-    if (object_dynamic_cast(OBJECT(dev), TYPE_CPU)) {
+    if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
+        pc_memory_pre_plug(hotplug_dev, dev, errp);
+    } else if (object_dynamic_cast(OBJECT(dev), TYPE_CPU)) {
         pc_cpu_pre_plug(hotplug_dev, dev, errp);
     }
 }
@@ -1977,7 +2422,7 @@ static void pc_machine_device_plug_cb(HotplugHandler *hotplug_dev,
                                       DeviceState *dev, Error **errp)
 {
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
-        pc_dimm_plug(hotplug_dev, dev, errp);
+        pc_memory_plug(hotplug_dev, dev, errp);
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_CPU)) {
         pc_cpu_plug(hotplug_dev, dev, errp);
     }
@@ -1987,7 +2432,7 @@ static void pc_machine_device_unplug_request_cb(HotplugHandler *hotplug_dev,
                                                 DeviceState *dev, Error **errp)
 {
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
-        pc_dimm_unplug_request(hotplug_dev, dev, errp);
+        pc_memory_unplug_request(hotplug_dev, dev, errp);
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_CPU)) {
         pc_cpu_unplug_request_cb(hotplug_dev, dev, errp);
     } else {
@@ -2000,7 +2445,7 @@ static void pc_machine_device_unplug_cb(HotplugHandler *hotplug_dev,
                                         DeviceState *dev, Error **errp)
 {
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM)) {
-        pc_dimm_unplug(hotplug_dev, dev, errp);
+        pc_memory_unplug(hotplug_dev, dev, errp);
     } else if (object_dynamic_cast(OBJECT(dev), TYPE_CPU)) {
         pc_cpu_unplug_cb(hotplug_dev, dev, errp);
     } else {
@@ -2009,27 +2454,24 @@ static void pc_machine_device_unplug_cb(HotplugHandler *hotplug_dev,
     }
 }
 
-static HotplugHandler *pc_get_hotpug_handler(MachineState *machine,
+static HotplugHandler *pc_get_hotplug_handler(MachineState *machine,
                                              DeviceState *dev)
 {
-    PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(machine);
-
     if (object_dynamic_cast(OBJECT(dev), TYPE_PC_DIMM) ||
         object_dynamic_cast(OBJECT(dev), TYPE_CPU)) {
         return HOTPLUG_HANDLER(machine);
     }
 
-    return pcmc->get_hotplug_handler ?
-        pcmc->get_hotplug_handler(machine, dev) : NULL;
+    return NULL;
 }
 
 static void
-pc_machine_get_hotplug_memory_region_size(Object *obj, Visitor *v,
-                                          const char *name, void *opaque,
-                                          Error **errp)
+pc_machine_get_device_memory_region_size(Object *obj, Visitor *v,
+                                         const char *name, void *opaque,
+                                         Error **errp)
 {
-    PCMachineState *pcms = PC_MACHINE(obj);
-    int64_t value = memory_region_size(&pcms->hotplug_memory.mr);
+    MachineState *ms = MACHINE(obj);
+    int64_t value = memory_region_size(&ms->device_memory->mr);
 
     visit_type_int(v, name, &value, errp);
 }
@@ -2057,7 +2499,7 @@ static void pc_machine_set_max_ram_below_4g(Object *obj, Visitor *v,
         error_propagate(errp, error);
         return;
     }
-    if (value > (1ULL << 32)) {
+    if (value > 4 * GiB) {
         error_setg(&error,
                    "Machine option 'max-ram-below-4g=%"PRIu64
                    "' expects size less than or equal to 4G", value);
@@ -2065,7 +2507,7 @@ static void pc_machine_set_max_ram_below_4g(Object *obj, Visitor *v,
         return;
     }
 
-    if (value < (1ULL << 20)) {
+    if (value < 1 * MiB) {
         warn_report("Only %" PRIu64 " bytes of RAM below the 4GiB boundary,"
                     "BIOS may not work with less than 1MiB", value);
     }
@@ -2146,46 +2588,73 @@ static void pc_machine_set_nvdimm(Object *obj, bool value, Error **errp)
     pcms->acpi_nvdimm_state.is_enabled = value;
 }
 
+static char *pc_machine_get_nvdimm_persistence(Object *obj, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    return g_strdup(pcms->acpi_nvdimm_state.persistence_string);
+}
+
+static void pc_machine_set_nvdimm_persistence(Object *obj, const char *value,
+                                               Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+    AcpiNVDIMMState *nvdimm_state = &pcms->acpi_nvdimm_state;
+
+    if (strcmp(value, "cpu") == 0)
+        nvdimm_state->persistence = 3;
+    else if (strcmp(value, "mem-ctrl") == 0)
+        nvdimm_state->persistence = 2;
+    else {
+        error_setg(errp, "-machine nvdimm-persistence=%s: unsupported option",
+                   value);
+        return;
+    }
+
+    g_free(nvdimm_state->persistence_string);
+    nvdimm_state->persistence_string = g_strdup(value);
+}
+
 static bool pc_machine_get_smbus(Object *obj, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
 
-    return pcms->smbus;
+    return pcms->smbus_enabled;
 }
 
 static void pc_machine_set_smbus(Object *obj, bool value, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
 
-    pcms->smbus = value;
+    pcms->smbus_enabled = value;
 }
 
 static bool pc_machine_get_sata(Object *obj, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
 
-    return pcms->sata;
+    return pcms->sata_enabled;
 }
 
 static void pc_machine_set_sata(Object *obj, bool value, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
 
-    pcms->sata = value;
+    pcms->sata_enabled = value;
 }
 
 static bool pc_machine_get_pit(Object *obj, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
 
-    return pcms->pit;
+    return pcms->pit_enabled;
 }
 
 static void pc_machine_set_pit(Object *obj, bool value, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
 
-    pcms->pit = value;
+    pcms->pit_enabled = value;
 }
 
 static void pc_machine_initfn(Object *obj)
@@ -2199,9 +2668,9 @@ static void pc_machine_initfn(Object *obj)
     pcms->acpi_nvdimm_state.is_enabled = false;
     /* acpi build is enabled by default if machine supports it */
     pcms->acpi_build_enabled = PC_MACHINE_GET_CLASS(pcms)->has_acpi_build;
-    pcms->smbus = true;
-    pcms->sata = true;
-    pcms->pit = true;
+    pcms->smbus_enabled = true;
+    pcms->sata_enabled = true;
+    pcms->pit_enabled = true;
 }
 
 static void pc_machine_reset(void)
@@ -2262,6 +2731,7 @@ static const CPUArchIdList *pc_possible_cpu_arch_ids(MachineState *ms)
     for (i = 0; i < ms->possible_cpus->len; i++) {
         X86CPUTopoInfo topo;
 
+        ms->possible_cpus->cpus[i].type = ms->cpu_type;
         ms->possible_cpus->cpus[i].vcpus_count = 1;
         ms->possible_cpus->cpus[i].arch_id = x86_cpu_apic_id_from_index(i);
         x86_topo_ids_from_apicid(ms->possible_cpus->cpus[i].arch_id,
@@ -2299,7 +2769,6 @@ static void pc_machine_class_init(ObjectClass *oc, void *data)
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(oc);
     NMIClass *nc = NMI_CLASS(oc);
 
-    pcmc->get_hotplug_handler = mc->get_hotplug_handler;
     pcmc->pci_enabled = true;
     pcmc->has_acpi_build = true;
     pcmc->rsdp_in_ram = true;
@@ -2314,10 +2783,13 @@ static void pc_machine_class_init(ObjectClass *oc, void *data)
     pcmc->acpi_data_size = 0x20000 + 0x8000;
     pcmc->save_tsc_khz = true;
     pcmc->linuxboot_dma_enabled = true;
-    mc->get_hotplug_handler = pc_get_hotpug_handler;
+    pcmc->pvh_enabled = true;
+    assert(!mc->get_hotplug_handler);
+    mc->get_hotplug_handler = pc_get_hotplug_handler;
     mc->cpu_index_to_instance_props = pc_cpu_index_to_props;
     mc->get_default_cpu_node_id = pc_get_default_cpu_node_id;
     mc->possible_cpu_arch_ids = pc_possible_cpu_arch_ids;
+    mc->auto_enable_numa_with_memhp = true;
     mc->has_hotpluggable_cpus = true;
     mc->default_boot_order = "cad";
     mc->hot_add_cpu = pc_hot_add_cpu;
@@ -2331,8 +2803,8 @@ static void pc_machine_class_init(ObjectClass *oc, void *data)
     nc->nmi_monitor_handler = x86_nmi;
     mc->default_cpu_type = TARGET_DEFAULT_CPU_TYPE;
 
-    object_class_property_add(oc, PC_MACHINE_MEMHP_REGION_SIZE, "int",
-        pc_machine_get_hotplug_memory_region_size, NULL,
+    object_class_property_add(oc, PC_MACHINE_DEVMEM_REGION_SIZE, "int",
+        pc_machine_get_device_memory_region_size, NULL,
         NULL, NULL, &error_abort);
 
     object_class_property_add(oc, PC_MACHINE_MAX_RAM_BELOW_4G, "size",
@@ -2356,6 +2828,10 @@ static void pc_machine_class_init(ObjectClass *oc, void *data)
 
     object_class_property_add_bool(oc, PC_MACHINE_NVDIMM,
         pc_machine_get_nvdimm, pc_machine_set_nvdimm, &error_abort);
+
+    object_class_property_add_str(oc, PC_MACHINE_NVDIMM_PERSIST,
+        pc_machine_get_nvdimm_persistence,
+        pc_machine_set_nvdimm_persistence, &error_abort);
 
     object_class_property_add_bool(oc, PC_MACHINE_SMBUS,
         pc_machine_get_smbus, pc_machine_set_smbus, &error_abort);

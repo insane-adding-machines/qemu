@@ -30,11 +30,8 @@
 #include "qemu/timer.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/cpus.h"
-#include "hw/timer/m48t59.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
-#include "qapi/error.h"
-#include "hw/loader.h"
 #include "sysemu/kvm.h"
 #include "kvm_ppc.h"
 #include "trace.h"
@@ -309,7 +306,105 @@ void ppcPOWER7_irq_init(PowerPCCPU *cpu)
     env->irq_inputs = (void **)qemu_allocate_irqs(&power7_set_irq, cpu,
                                                   POWER7_INPUT_NB);
 }
+
+/* POWER9 internal IRQ controller */
+static void power9_set_irq(void *opaque, int pin, int level)
+{
+    PowerPCCPU *cpu = opaque;
+    CPUPPCState *env = &cpu->env;
+
+    LOG_IRQ("%s: env %p pin %d level %d\n", __func__,
+                env, pin, level);
+
+    switch (pin) {
+    case POWER9_INPUT_INT:
+        /* Level sensitive - active high */
+        LOG_IRQ("%s: set the external IRQ state to %d\n",
+                __func__, level);
+        ppc_set_irq(cpu, PPC_INTERRUPT_EXT, level);
+        break;
+    case POWER9_INPUT_HINT:
+        /* Level sensitive - active high */
+        LOG_IRQ("%s: set the external IRQ state to %d\n",
+                __func__, level);
+        ppc_set_irq(cpu, PPC_INTERRUPT_HVIRT, level);
+        break;
+    default:
+        /* Unknown pin - do nothing */
+        LOG_IRQ("%s: unknown IRQ pin %d\n", __func__, pin);
+        return;
+    }
+    if (level) {
+        env->irq_input_state |= 1 << pin;
+    } else {
+        env->irq_input_state &= ~(1 << pin);
+    }
+}
+
+void ppcPOWER9_irq_init(PowerPCCPU *cpu)
+{
+    CPUPPCState *env = &cpu->env;
+
+    env->irq_inputs = (void **)qemu_allocate_irqs(&power9_set_irq, cpu,
+                                                  POWER9_INPUT_NB);
+}
 #endif /* defined(TARGET_PPC64) */
+
+void ppc40x_core_reset(PowerPCCPU *cpu)
+{
+    CPUPPCState *env = &cpu->env;
+    target_ulong dbsr;
+
+    qemu_log_mask(CPU_LOG_RESET, "Reset PowerPC core\n");
+    cpu_interrupt(CPU(cpu), CPU_INTERRUPT_RESET);
+    dbsr = env->spr[SPR_40x_DBSR];
+    dbsr &= ~0x00000300;
+    dbsr |= 0x00000100;
+    env->spr[SPR_40x_DBSR] = dbsr;
+}
+
+void ppc40x_chip_reset(PowerPCCPU *cpu)
+{
+    CPUPPCState *env = &cpu->env;
+    target_ulong dbsr;
+
+    qemu_log_mask(CPU_LOG_RESET, "Reset PowerPC chip\n");
+    cpu_interrupt(CPU(cpu), CPU_INTERRUPT_RESET);
+    /* XXX: TODO reset all internal peripherals */
+    dbsr = env->spr[SPR_40x_DBSR];
+    dbsr &= ~0x00000300;
+    dbsr |= 0x00000200;
+    env->spr[SPR_40x_DBSR] = dbsr;
+}
+
+void ppc40x_system_reset(PowerPCCPU *cpu)
+{
+    qemu_log_mask(CPU_LOG_RESET, "Reset PowerPC system\n");
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+void store_40x_dbcr0(CPUPPCState *env, uint32_t val)
+{
+    PowerPCCPU *cpu = ppc_env_get_cpu(env);
+
+    switch ((val >> 28) & 0x3) {
+    case 0x0:
+        /* No action */
+        break;
+    case 0x1:
+        /* Core reset */
+        ppc40x_core_reset(cpu);
+        break;
+    case 0x2:
+        /* Chip reset */
+        ppc40x_chip_reset(cpu);
+        break;
+    case 0x3:
+        /* System reset */
+        ppc40x_system_reset(cpu);
+        break;
+    }
+}
 
 /* PowerPC 40x internal IRQ controller */
 static void ppc40x_set_irq(void *opaque, int pin, int level)
@@ -723,7 +818,7 @@ static inline void cpu_ppc_hdecr_excp(PowerPCCPU *cpu)
      * interrupts in a PM state. Not only they don't cause a
      * wakeup but they also get effectively discarded.
      */
-    if (!env->in_pm_state) {
+    if (!env->resume_as_sreset) {
         ppc_set_irq(cpu, PPC_INTERRUPT_HDECR, 1);
     }
 }
@@ -1358,29 +1453,4 @@ void PPC_debug_write (void *opaque, uint32_t addr, uint32_t val)
         qemu_set_log(val | 0x100);
         break;
     }
-}
-
-void ppc_cpu_parse_features(const char *cpu_model)
-{
-    CPUClass *cc;
-    ObjectClass *oc;
-    const char *typename;
-    gchar **model_pieces;
-
-    model_pieces = g_strsplit(cpu_model, ",", 2);
-    if (!model_pieces[0]) {
-        error_report("Invalid/empty CPU model name");
-        exit(1);
-    }
-
-    oc = cpu_class_by_name(TYPE_POWERPC_CPU, model_pieces[0]);
-    if (oc == NULL) {
-        error_report("Unable to find CPU definition: %s", model_pieces[0]);
-        exit(1);
-    }
-
-    typename = object_class_get_name(oc);
-    cc = CPU_CLASS(oc);
-    cc->parse_features(typename, model_pieces[1], &error_fatal);
-    g_strfreev(model_pieces);
 }

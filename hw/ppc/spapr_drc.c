@@ -12,6 +12,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qmp/qnull.h"
 #include "cpu.h"
 #include "qemu/cutils.h"
 #include "hw/ppc/spapr_drc.h"
@@ -21,6 +22,7 @@
 #include "qemu/error-report.h"
 #include "hw/ppc/spapr.h" /* for RTAS return codes */
 #include "hw/pci-host/spapr.h" /* spapr_phb_remove_pci_device_cb callback */
+#include "sysemu/device_tree.h"
 #include "trace.h"
 
 #define DRC_CONTAINER_PATH "/dr-connector"
@@ -304,7 +306,7 @@ static void prop_get_fdt(Object *obj, Visitor *v, const char *name,
 
     if (!drc->fdt) {
         visit_type_null(v, NULL, &null, errp);
-        QDECREF(null);
+        qobject_unref(null);
         return;
     }
 
@@ -365,14 +367,14 @@ static void prop_get_fdt(Object *obj, Visitor *v, const char *name,
             break;
         }
         default:
-            error_setg(&error_abort, "device FDT in unexpected state: %d", tag);
+            error_report("device FDT in unexpected state: %d", tag);
+            abort();
         }
         fdt_offset = fdt_offset_next;
     } while (fdt_depth != 0);
 }
 
-void spapr_drc_attach(sPAPRDRConnector *drc, DeviceState *d, void *fdt,
-                      int fdt_start_offset, Error **errp)
+void spapr_drc_attach(sPAPRDRConnector *drc, DeviceState *d, Error **errp)
 {
     trace_spapr_drc_attach(spapr_drc_index(drc));
 
@@ -382,11 +384,8 @@ void spapr_drc_attach(sPAPRDRConnector *drc, DeviceState *d, void *fdt,
     }
     g_assert((drc->state == SPAPR_DRC_STATE_LOGICAL_UNUSABLE)
              || (drc->state == SPAPR_DRC_STATE_PHYSICAL_POWERON));
-    g_assert(fdt);
 
     drc->dev = d;
-    drc->fdt = fdt;
-    drc->fdt_start_offset = fdt_start_offset;
 
     object_property_add_link(OBJECT(drc), "device",
                              object_get_typename(OBJECT(drc->dev)),
@@ -455,11 +454,6 @@ void spapr_drc_reset(sPAPRDRConnector *drc)
     }
 }
 
-static void drc_reset(void *opaque)
-{
-    spapr_drc_reset(SPAPR_DR_CONNECTOR(opaque));
-}
-
 bool spapr_drc_needed(void *opaque)
 {
     sPAPRDRConnector *drc = (sPAPRDRConnector *)opaque;
@@ -518,7 +512,6 @@ static void realize(DeviceState *d, Error **errp)
     }
     vmstate_register(DEVICE(drc), spapr_drc_index(drc), &vmstate_spapr_drc,
                      drc);
-    qemu_register_reset(drc_reset, drc);
     trace_spapr_drc_realize_complete(spapr_drc_index(drc));
 }
 
@@ -529,7 +522,6 @@ static void unrealize(DeviceState *d, Error **errp)
     gchar *name;
 
     trace_spapr_drc_unrealize(spapr_drc_index(drc));
-    qemu_unregister_reset(drc_reset, drc);
     vmstate_unregister(DEVICE(drc), &vmstate_spapr_drc, drc);
     root_container = container_get(object_get_root(), DRC_CONTAINER_PATH);
     name = g_strdup_printf("%x", spapr_drc_index(drc));
@@ -679,6 +671,7 @@ static void spapr_drc_cpu_class_init(ObjectClass *k, void *data)
     drck->typename = "CPU";
     drck->drc_name_prefix = "CPU ";
     drck->release = spapr_core_release;
+    drck->dt_populate = spapr_core_dt_populate;
 }
 
 static void spapr_drc_pci_class_init(ObjectClass *k, void *data)
@@ -689,6 +682,7 @@ static void spapr_drc_pci_class_init(ObjectClass *k, void *data)
     drck->typename = "28";
     drck->drc_name_prefix = "C";
     drck->release = spapr_phb_remove_pci_device_cb;
+    drck->dt_populate = spapr_pci_dt_populate;
 }
 
 static void spapr_drc_lmb_class_init(ObjectClass *k, void *data)
@@ -699,6 +693,18 @@ static void spapr_drc_lmb_class_init(ObjectClass *k, void *data)
     drck->typename = "MEM";
     drck->drc_name_prefix = "LMB ";
     drck->release = spapr_lmb_release;
+    drck->dt_populate = spapr_lmb_dt_populate;
+}
+
+static void spapr_drc_phb_class_init(ObjectClass *k, void *data)
+{
+    sPAPRDRConnectorClass *drck = SPAPR_DR_CONNECTOR_CLASS(k);
+
+    drck->typeshift = SPAPR_DR_CONNECTOR_TYPE_SHIFT_PHB;
+    drck->typename = "PHB";
+    drck->drc_name_prefix = "PHB ";
+    drck->release = spapr_phb_release;
+    drck->dt_populate = spapr_phb_dt_populate;
 }
 
 static const TypeInfo spapr_dr_connector_info = {
@@ -742,6 +748,13 @@ static const TypeInfo spapr_drc_lmb_info = {
     .name          = TYPE_SPAPR_DRC_LMB,
     .parent        = TYPE_SPAPR_DRC_LOGICAL,
     .class_init    = spapr_drc_lmb_class_init,
+};
+
+static const TypeInfo spapr_drc_phb_info = {
+    .name          = TYPE_SPAPR_DRC_PHB,
+    .parent        = TYPE_SPAPR_DRC_LOGICAL,
+    .instance_size = sizeof(sPAPRDRConnector),
+    .class_init    = spapr_drc_phb_class_init,
 };
 
 /* helper functions for external users */
@@ -1107,9 +1120,27 @@ static void rtas_ibm_configure_connector(PowerPCCPU *cpu,
         goto out;
     }
 
-    g_assert(drc->fdt);
-
     drck = SPAPR_DR_CONNECTOR_GET_CLASS(drc);
+
+    if (!drc->fdt) {
+        Error *local_err = NULL;
+        void *fdt;
+        int fdt_size;
+
+        fdt = create_device_tree(&fdt_size);
+
+        if (drck->dt_populate(drc, spapr, fdt, &drc->fdt_start_offset,
+                              &local_err)) {
+            g_free(fdt);
+            error_free(local_err);
+            rc = SPAPR_DR_CC_RESPONSE_ERROR;
+            goto out;
+        }
+
+        drc->fdt = fdt;
+        drc->ccs_offset = drc->fdt_start_offset;
+        drc->ccs_depth = 0;
+    }
 
     do {
         uint32_t tag;
@@ -1194,6 +1225,7 @@ static void spapr_drc_register_types(void)
     type_register_static(&spapr_drc_cpu_info);
     type_register_static(&spapr_drc_pci_info);
     type_register_static(&spapr_drc_lmb_info);
+    type_register_static(&spapr_drc_phb_info);
 
     spapr_rtas_register(RTAS_SET_INDICATOR, "set-indicator",
                         rtas_set_indicator);

@@ -34,7 +34,7 @@ typedef struct PnvCore {
     CPUCore parent_obj;
 
     /*< public >*/
-    void *threads;
+    PowerPCCPU **threads;
     uint32_t pir;
 
     MemoryRegion xscom_regs;
@@ -42,9 +42,18 @@ typedef struct PnvCore {
 
 typedef struct PnvCoreClass {
     DeviceClass parent_class;
-    ObjectClass *cpu_oc;
 } PnvCoreClass;
 
-extern char *pnv_core_typename(const char *model);
+#define PNV_CORE_TYPE_SUFFIX "-" TYPE_PNV_CORE
+#define PNV_CORE_TYPE_NAME(cpu_model) cpu_model PNV_CORE_TYPE_SUFFIX
+
+typedef struct PnvCPUState {
+    struct ICPState *icp;
+} PnvCPUState;
+
+static inline PnvCPUState *pnv_cpu_state(PowerPCCPU *cpu)
+{
+    return (PnvCPUState *)cpu->machine_data;
+}
 
 #endif /* _PPC_PNV_CORE_H */
